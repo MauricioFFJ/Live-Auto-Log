@@ -1,0 +1,118 @@
+name: (Comando) Ir ao Cafofo
+
+on:
+  workflow_dispatch:
+    inputs:
+      contas_01_05:
+        description: "Contas 01–05"
+        required: false
+        default: false
+        type: boolean
+      contas_06_10:
+        description: "Contas 06–10"
+        required: false
+        default: false
+        type: boolean
+      contas_11_15:
+        description: "Contas 11–15"
+        required: false
+        default: false
+        type: boolean
+      contas_16_20:
+        description: "Contas 16–20"
+        required: false
+        default: false
+        type: boolean
+      contas_21_25:
+        description: "Contas 21–25"
+        required: false
+        default: false
+        type: boolean
+      contas_26_30:
+        description: "Contas 26–30"
+        required: false
+        default: false
+        type: boolean
+      contas_31_35:
+        description: "Contas 31–35"
+        required: false
+        default: false
+        type: boolean
+      contas_36_40:
+        description: "Contas 36–40"
+        required: false
+        default: false
+        type: boolean
+      contas_41_45:
+        description: "Contas 41–45"
+        required: false
+        default: false
+        type: boolean
+      contas_46_50:
+        description: "Contas 46–50"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  enviar-comando:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publicar comando IR AO CAFOFO
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const inputs = context.payload.inputs || {};
+            const grupos = [
+              { campo: 'contas_01_05', contas: [1, 2, 3, 4, 5] },
+              { campo: 'contas_06_10', contas: [6, 7, 8, 9, 10] },
+              { campo: 'contas_11_15', contas: [11, 12, 13, 14, 15] },
+              { campo: 'contas_16_20', contas: [16, 17, 18, 19, 20] },
+              { campo: 'contas_21_25', contas: [21, 22, 23, 24, 25] },
+              { campo: 'contas_26_30', contas: [26, 27, 28, 29, 30] },
+              { campo: 'contas_31_35', contas: [31, 32, 33, 34, 35] },
+              { campo: 'contas_36_40', contas: [36, 37, 38, 39, 40] },
+              { campo: 'contas_41_45', contas: [41, 42, 43, 44, 45] },
+              { campo: 'contas_46_50', contas: [46, 47, 48, 49, 50] },
+            ];
+
+            const selecionados = grupos.filter(g =>
+              inputs[g.campo] === true || inputs[g.campo] === 'true'
+            );
+            if (selecionados.length === 0) {
+              core.setFailed('Selecione pelo menos um grupo de contas.');
+              return;
+            }
+
+            const contas = selecionados.flatMap(g => g.contas);
+            const runId = process.env.GITHUB_RUN_ID;
+            const runAttempt = process.env.GITHUB_RUN_ATTEMPT || '1';
+            if (!runId) {
+              core.setFailed('GITHUB_RUN_ID indisponível.');
+              return;
+            }
+            const id = `${runId}-${runAttempt}`;
+            const comando = {
+              id,
+              action: 'go_home',
+              targets: contas,
+              created_at: new Date().toISOString(),
+            };
+            const caminho = `commands/${id}.json`;
+            const branch = context.ref.replace('refs/heads/', '');
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path: caminho,
+              message: `IR AO CAFOFO: publicar comando ${id}` ,
+              content: Buffer.from(JSON.stringify(comando, null, 2)).toString('base64'),
+              branch,
+            });
+
+            core.info(`Comando IR AO CAFOFO publicado: ${id}`);
+            core.info(`Contas selecionadas: ${contas.join(', ')}`);
+            core.info(`Arquivo: ${caminho}`);

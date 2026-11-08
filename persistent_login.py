@@ -36,7 +36,8 @@ CAFOFO_MAX_ATTEMPTS = max(1, int(os.getenv("CAFOFO_MAX_ATTEMPTS", "2")))
 RESPEITAR_MAX_ATTEMPTS = 1  # Nunca repetir automaticamente uma acao que consome respeitos.
 RESPEITAR_SCRIPT_TIMEOUT = max(85, int(os.getenv("RESPEITAR_SCRIPT_TIMEOUT", "105")))
 VISITAR_QUARTO_SCRIPT_TIMEOUT = max(30, int(os.getenv("VISITAR_QUARTO_SCRIPT_TIMEOUT", "60")))
-TRATAR_CARINHOS_SCRIPT_TIMEOUT = max(120, int(os.getenv("TRATAR_CARINHOS_SCRIPT_TIMEOUT", "480")))
+TRATAR_CARINHOS_MAX_SECONDS = max(60, int(os.getenv("TRATAR_CARINHOS_MAX_SECONDS", "300")))
+TRATAR_CARINHOS_POLL_SECONDS = max(2, int(os.getenv("TRATAR_CARINHOS_POLL_SECONDS", "3")))
 FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "1")))  # Evita várias tentativas longas em Chrome travado.
 CHAT_MAX_SIMULTANEOS = max(1, int(os.getenv("CHAT_MAX_SIMULTANEOS", "5")))  # Contas independentes: sem fila global por padrão.
 CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "25")))
@@ -1182,17 +1183,253 @@ function decidir(ordenados) {
 
 # ---------- Ação: TRATAR E CARINHOS ----------
 class CarinhosIndeterminado(Exception):
-    """A interface pode ter executado cliques sem confirmar a resposta HTTP."""
+    """Houve uma falha e algum clique pode já ter sido executado."""
+
+
+# Este script inicia uma tarefa ASSÍNCRONA dentro da página e retorna rapidamente.
+# A tarefa continua trabalhando no DOM; o Python consulta o progresso em pequenas
+# chamadas separadas. Isso evita um execute_async_script bloqueado por 8 minutos.
+TRATAR_CARINHOS_JS = r"""
+// Executado com driver.execute_script. Inicia uma tarefa em background NA PAGINA
+// e devolve imediatamente o controle ao Python.
+const comandoId = String(arguments[0]);
+const limiteSegundos = Math.max(60, Math.min(1800, Number(arguments[1]) || 300));
+const CHAVE = '__habblive_tratar_carinhos_v2';
+const antiga = window[CHAVE];
+if (antiga && antiga.id === comandoId) {
+    return { aceite: true, retomada: true, estado: antiga.estado, id: comandoId };
+}
+if (antiga && antiga.estado === 'executando') {
+    return { aceite: false, motivo: 'Outra tarefa de cuidados continua em execucao', id: antiga.id };
+}
+const job = {
+    id: comandoId, estado: 'executando', fase: 'iniciando',
+    total: 0, processados: 0, tratados: 0, carinhos: 0,
+    sem_acao: 0, erros: 0, fechado: false,
+    nome_atual: '', iniciado: Date.now(), fim: null,
+    limite: Date.now() + limiteSegundos * 1000,
+    eventos: [], seq: 0, detalhes: ''
+};
+window[CHAVE] = job;
+const registrar = (mensagem) => {
+    job.seq++;
+    job.eventos.push({ seq: job.seq, texto: String(mensagem) });
+    if (job.eventos.length > 250) job.eventos.shift();
+};
+const texto = el => ((el && el.textContent) || '').trim().replace(/\s+/g, ' ');
+const normalizar = s => String(s || '').trim().toLocaleLowerCase('pt-BR');
+const pausa = ms => new Promise(resolve => setTimeout(resolve, ms));
+const visivel = el => {
+    if (!el || !el.isConnected) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0'
+        && el.getClientRects().length > 0;
+};
+const verificarPrazo = () => {
+    if (Date.now() > job.limite) throw new Error('Limite de tempo atingido antes de terminar todos os mascotes.');
+};
+async function aguardar(fn, limiteMs, intervalo = 65) {
+    const termina = Date.now() + limiteMs;
+    while (Date.now() <= termina) {
+        verificarPrazo();
+        const achou = fn();
+        if (achou) return achou;
+        await pausa(intervalo);
+    }
+    return null;
+}
+function selectMascote() {
+    return Array.from(document.querySelectorAll('select.form-select.form-select-sm'))
+        .find(el => visivel(el) && Array.from(el.options || []).some(o => o.value === 'mascote')) || null;
+}
+function raiz() {
+    const select = selectMascote();
+    if (!select) return null;
+    const card = select.closest('.nitro-card') || select.closest('[class*="nitro-card"]');
+    return (card && card.querySelector('tr.rounded.p-1')) ? card : document;
+}
+function linhas() {
+    const area = raiz();
+    if (!area) return [];
+    return Array.from(area.querySelectorAll('tr.rounded.p-1')).filter(tr => {
+        if (!visivel(tr)) return false;
+        const tds = tr.querySelectorAll('td');
+        const nome = tr.querySelector('td:first-child .d-inline.text-black.text-truncate');
+        return tds.length >= 2 && nome && texto(nome) && /mascote|planta/i.test(texto(tds[1]));
+    });
+}
+function nomeLinha(tr) {
+    return texto(tr && tr.querySelector('td:first-child .d-inline.text-black.text-truncate'));
+}
+function inventario() {
+    const repetidos = new Map();
+    return linhas().map((linha, indice) => {
+        const nome = nomeLinha(linha), chave = normalizar(nome);
+        const ocorrencia = repetidos.get(chave) || 0;
+        repetidos.set(chave, ocorrencia + 1);
+        return { nome, indice, ocorrencia, linha };
+    });
+}
+function localizar(item) {
+    const atuais = linhas();
+    if (item.linha && atuais.includes(item.linha)) return item.linha;
+    if (atuais[item.indice] && normalizar(nomeLinha(atuais[item.indice])) === normalizar(item.nome))
+        return atuais[item.indice];
+    return atuais.filter(row => normalizar(nomeLinha(row)) === normalizar(item.nome))[item.ocorrencia] || null;
+}
+function opcao() {
+    const menu = Array.from(document.querySelectorAll('.nitro-context-menu.visible')).find(visivel);
+    // Restricao ao menu visivel evita clicar em opcoes de outros componentes.
+    if (!menu) return null;
+    for (const el of Array.from(menu.querySelectorAll('div.menu-item.list-item')).filter(visivel)) {
+        const label = texto(el);
+        if (/^tratar$/i.test(label)) return { tipo: 'tratar', el };
+        const m = label.match(/^acarici(?:a|ar)\s*\(\s*(\d+)\s*\)$/i);
+        if (m) return { tipo: 'acariciar', numero: Number(m[1]), el };
+    }
+    return null;
+}
+async function abrirMenu(item, maxTentativas = 2) {
+    for (let tentativa = 0; tentativa < maxTentativas; tentativa++) {
+        const linha = localizar(item);
+        if (!linha) throw new Error('Linha saiu da lista antes do clique.');
+        const nome = linha.querySelector('td:first-child .d-inline.text-black.text-truncate') || linha;
+        nome.click();
+        const achou = await aguardar(opcao, 500);
+        if (achou) return achou;
+    }
+    return null;
+}
+async function acariciar(item, primeira) {
+    let atual = primeira;
+    let cliques = 0;
+    while (atual && atual.tipo === 'acariciar') {
+        verificarPrazo();
+        if (++cliques > 15) throw new Error('Mais de 15 cliques em um unico mascote; abortando item.');
+        const numeroAntes = atual.numero;
+        if (!Number.isInteger(numeroAntes) || numeroAntes < 1 || numeroAntes > 99)
+            throw new Error('Contador Acaricia invalido.');
+        atual.el.click();
+        // Contabiliza o clique enviado, não confirma ainda o respeito no servidor.
+        job.carinhos++;
+        await pausa(90);
+        let nova = opcao();
+        if (nova && nova.tipo === 'acariciar' && nova.numero >= numeroAntes) {
+            nova = await aguardar(() => {
+                const a = opcao();
+                return (!a || a.tipo !== 'acariciar' || a.numero < numeroAntes) ? { opcao: a } : null;
+            }, 750);
+            nova = nova ? nova.opcao : opcao();
+        }
+        if (!nova) {
+            // O menu costuma fechar depois de clicar. Reabre para ler o NOVO contador.
+            nova = await abrirMenu(item, 1);
+        }
+        if (!nova || nova.tipo !== 'acariciar') return cliques;
+        if (nova.numero >= numeroAntes) {
+            // Nao repetir quando houve clique, mas o contador nao mudou.
+            throw new Error('Acaricia (' + numeroAntes + ') nao diminuiu; sem repetir clique incerto.');
+        }
+        atual = nova;
+    }
+    return cliques;
+}
+function fecharChooser() {
+    const select = selectMascote();
+    const card = select && (select.closest('.nitro-card') || select.closest('[class*="nitro-card"]'));
+    const closes = Array.from(document.querySelectorAll('.nitro-card-header-close')).filter(visivel);
+    const btn = (card && closes.find(el => card.contains(el))) || closes[closes.length - 1];
+    if (!btn) return false;
+    btn.click();
+    return true;
+}
+async function executar() {
+    try {
+        job.fase = 'aguardando chooser';
+        const select = await aguardar(selectMascote, 9000);
+        if (!select) throw new Error('Nao foi encontrado filtro mascote do chooser.');
+        job.fase = 'selecionando mascote';
+        const setValue = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+        setValue.call(select, 'mascote');
+        select.dispatchEvent(new Event('input', { bubbles: true }));
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+        registrar('Filtro mascote selecionado.');
+        await pausa(200);
+        if (select.value !== 'mascote') throw new Error('Nao foi possivel selecionar mascote.');
+
+        job.fase = 'obtendo itens';
+        await aguardar(() => linhas().length > 0, 5000);
+        const itens = inventario();
+        job.total = itens.length;
+        registrar('Detectados ' + itens.length + ' itens; nomes repetidos sao linhas distintas.');
+        if (itens.length > 250) throw new Error('Mais de 250 itens: interrompido para seguranca.');
+        for (const item of itens) {
+            verificarPrazo();
+            job.nome_atual = item.nome + ' #' + (item.ocorrencia + 1);
+            job.fase = 'processando ' + job.nome_atual;
+            try {
+                const op = await abrirMenu(item, 2);
+                if (!op) {
+                    job.sem_acao++;
+                    registrar(job.nome_atual + ': sem Tratar/Acaricia');
+                } else if (op.tipo === 'tratar') {
+                    op.el.click();
+                    job.tratados++;
+                    registrar(job.nome_atual + ': clique Tratar enviado');
+                    await pausa(75);
+                } else {
+                    const totalCliques = await acariciar(item, op);
+                    registrar(job.nome_atual + ': ' + totalCliques + ' clique(s) Acaricia enviados');
+                }
+            } catch (e) {
+                job.erros++;
+                registrar(job.nome_atual + ': erro/resultado incerto: ' + String(e?.message || e));
+            }
+            job.processados++;
+            await pausa(60);
+        }
+        job.fase = 'fechando chooser';
+        job.fechado = fecharChooser();
+        job.estado = job.erros ? 'parcial' : 'concluido';
+        registrar('Finalizado: ' + job.processados + '/' + job.total + ' itens, erros=' + job.erros);
+    } catch (e) {
+        job.detalhes = String(e?.message || e);
+        registrar('Interrompido: ' + job.detalhes);
+        job.estado = job.processados ? 'parcial' : 'erro';
+        job.fase = 'interrompido';
+        try { job.fechado = fecharChooser(); } catch (_) {}
+    } finally {
+        job.fim = Date.now();
+    }
+}
+// Inicia o processamento local e retorna imediatamente ao Selenium.
+void executar();
+return { aceite: true, retomada: false, estado: job.estado, id: comandoId };
+"""
+
+TRATAR_CARINHOS_STATUS_JS = r"""
+const id = String(arguments[0]);
+const depois = Number(arguments[1]) || 0;
+const job = window.__habblive_tratar_carinhos_v2;
+if (!job || job.id !== id) return { existe: false, id };
+return {
+    existe: true, id: job.id, estado: job.estado, fase: job.fase,
+    total: job.total, processados: job.processados,
+    tratados: job.tratados, carinhos: job.carinhos,
+    sem_acao: job.sem_acao, erros: job.erros,
+    fechado: job.fechado, nome_atual: job.nome_atual,
+    detalhes: job.detalhes,
+    ultimo_seq: job.seq,
+    eventos: job.eventos.filter(e => e.seq > depois).slice(-30)
+};
+"""
 
 
 def tratar_e_carinhos(driver, account_id, comando_id):
-    """Percorre dinamicamente cada linha de mascote/planta do :chooser.
+    """Trata mascotes em JS na pagina, sem bloquear o ChromeDriver por minutos.
 
-    Mantém nomes repetidos como entradas distintas, clica Tratar uma vez ou
-    Acaricia (X) até o contador sumir, e fecha o chooser ao final.
-
-    Executa JS assíncrono em uma única interação com o ChromeDriver para
-    reduzir chamadas remotas; não reexecuta toda a sequência ao falhar.
+    A lista e dinamica e respeita linhas duplicadas. Em caso de resultado
+    incerto, NAO repete a operacao automaticamente.
     """
     inicio = time.monotonic()
     marcar_etapa(
@@ -1200,332 +1437,114 @@ def tratar_e_carinhos(driver, account_id, comando_id):
         f"TRATAR E CARINHOS: abrindo :chooser ({comando_id})...",
         status="🌿 TRATAR E CARINHOS",
     )
-
     try:
-        # Reutiliza exatamente o mecanismo de teclado funcional do FALAR.
+        # Mantem o metodo FALAR que ja funciona na instalacao do usuario.
         enviar_mensagem(driver, account_id, ":chooser", f"{comando_id}:chooser")
     except Exception as erro:
         raise CarinhosIndeterminado(
-            f"TRATAR E CARINHOS {comando_id}: envio do :chooser incerto; "
-            f"não será repetido ({type(erro).__name__}: {str(erro)[:180]})."
+            f"TRATAR E CARINHOS {comando_id}: envio de :chooser incerto: "
+            f"{type(erro).__name__}: {str(erro)[:250]}. Sem repeticao automatica."
         ) from erro
 
     marcar_etapa(
         account_id,
-        "TRATAR E CARINHOS: filtrando mascotes e processando linhas da lista...",
+        "TRATAR E CARINHOS: iniciando processamento JavaScript na pagina...",
         status="🌿 TRATAR E CARINHOS",
     )
-
-    # O chooser pode ter dezenas de animais. Aumentar também o limite de HTTP
-    # evita que o transporte do Selenium cancele uma operação JS ainda ativa.
-    executor = getattr(driver, "command_executor", None)
-    client_config = getattr(executor, "client_config", None)
-    timeout_anterior = None
-    timeout_alterado = False
-    if client_config is not None:
-        try:
-            timeout_anterior = client_config.timeout
-            client_config.timeout = TRATAR_CARINHOS_SCRIPT_TIMEOUT + 30
-            timeout_alterado = True
-        except Exception:
-            pass
-
     try:
-        driver.set_script_timeout(TRATAR_CARINHOS_SCRIPT_TIMEOUT)
-        resposta = driver.execute_async_script(
-            TRATAR_CARINHOS_JS,
-            (TRATAR_CARINHOS_SCRIPT_TIMEOUT - 15) * 1000,
+        inicio_job = driver.execute_script(
+            TRATAR_CARINHOS_JS, comando_id, TRATAR_CARINHOS_MAX_SECONDS
         )
     except Exception as erro:
         raise CarinhosIndeterminado(
-            f"TRATAR E CARINHOS {comando_id}: execução sem resposta confirmada "
-            f"({type(erro).__name__}: {str(erro)[:230]}). "
-            "Não vou reiniciar a lista porque alguns cliques podem já ter ocorrido."
+            f"Falha ao iniciar processamento no navegador: "
+            f"{type(erro).__name__}: {str(erro)[:250]}. "
+            "A tarefa pode ter sido iniciada; nao vou repetir automaticamente."
         ) from erro
-    finally:
-        if timeout_alterado:
-            try:
-                client_config.timeout = timeout_anterior
-            except Exception:
-                pass
-
-    if not isinstance(resposta, dict):
+    if not isinstance(inicio_job, dict) or not inicio_job.get("aceite"):
         raise CarinhosIndeterminado(
-            f"TRATAR E CARINHOS {comando_id}: resposta inesperada: {resposta!r}"
+            f"Nao foi possivel iniciar TRATAR E CARINHOS: {inicio_job!r}"
         )
-
-    for detalhe in resposta.get("anotacoes", []):
-        log(f"[Conta {account_id}] CARINHOS: {detalhe}", Fore.CYAN)
-
-    estado = resposta.get("estado", "desconhecido")
-    qtd = resposta.get("total", 0)
-    proc = resposta.get("processados", 0)
-    tratados = resposta.get("tratados", 0)
-    carinhos = resposta.get("carinhos", 0)
-    erros = resposta.get("erros", 0)
-    fechou = resposta.get("fechado", False)
-    duracao = time.monotonic() - inicio
 
     log(
-        f"[Conta {account_id}] TRATAR E CARINHOS {comando_id}: "
-        f"estado={estado}; itens={qtd}; processados={proc}; "
-        f"tratados={tratados}; carinhos={carinhos}; erros={erros}; "
-        f"fechou={fechou}; tempo={duracao:.1f}s.",
-        Fore.GREEN if estado in ("concluido", "sem_mascotes") else Fore.YELLOW,
+        f"[Conta {account_id}] TRATAR E CARINHOS: JavaScript iniciado "
+        f"(ID {comando_id}); acompanhamento por progresso, "
+        f"limite {TRATAR_CARINHOS_MAX_SECONDS}s.",
+        Fore.GREEN,
     )
+    ultimo_seq = 0
+    ultimo_processado = -1
+    limite_pesquisa = time.monotonic() + TRATAR_CARINHOS_MAX_SECONDS + 30
 
-    if estado not in ("concluido", "parcial", "sem_mascotes"):
-        raise CarinhosIndeterminado(
-            f"TRATAR E CARINHOS {comando_id}: encerramento incompleto; "
-            f"fase={resposta.get('fase')!r}, erro={resposta.get('erro')!r}. "
-            "Ação NÃO será repetida automaticamente."
-        )
+    while time.monotonic() < limite_pesquisa:
+        try:
+            status = driver.execute_script(
+                TRATAR_CARINHOS_STATUS_JS, comando_id, ultimo_seq
+            )
+        except Exception as erro:
+            raise CarinhosIndeterminado(
+                f"TRATAR E CARINHOS {comando_id}: falha ao consultar progresso "
+                f"({type(erro).__name__}: {str(erro)[:220]}). "
+                "O navegador pode continuar executando a tarefa. Nao repetir."
+            ) from erro
 
-    if not fechou:
-        log(
-            f"[Conta {account_id}] AVISO: chooser possivelmente ainda aberto; "
-            "fechamento não confirmado.",
-            Fore.YELLOW,
-        )
-    return estado
+        if not isinstance(status, dict) or not status.get("existe"):
+            raise CarinhosIndeterminado(
+                f"TRATAR E CARINHOS {comando_id}: tarefa desapareceu do navegador "
+                "(possivel recarregamento da pagina). Nao repetir automaticamente."
+            )
 
+        for evento in status.get("eventos", []):
+            log(f"[Conta {account_id}] CARINHOS: {evento.get('texto', '')}", Fore.CYAN)
+        ultimo_seq = max(ultimo_seq, int(status.get("ultimo_seq", 0)))
 
-TRATAR_CARINHOS_JS = r"""
-const responder = arguments[arguments.length - 1];
-const limiteMs = Math.max(15000, Number(arguments[0]) || 360000);
-const inicio = performance.now();
-const anotacoes = [];
-const estatisticas = { total: 0, processados: 0, tratados: 0, carinhos: 0, sem_acao: 0, erros: 0 };
-let fase = 'inicializando';
-let jaRespondeu = false;
+        processados = int(status.get("processados", 0))
+        total = int(status.get("total", 0))
+        if processados != ultimo_processado:
+            ultimo_processado = processados
+            marcar_etapa(
+                account_id,
+                f"TRATAR E CARINHOS: {processados}/{total} itens - "
+                f"{status.get('nome_atual', '')[:45]}",
+                status="🌿 TRATAR E CARINHOS",
+                registrar=False,
+            )
+            log(
+                f"[Conta {account_id}] TRATAR E CARINHOS: progresso "
+                f"{processados}/{total}; tratados={status.get('tratados', 0)}; "
+                f"carinhos={status.get('carinhos', 0)}; erros={status.get('erros', 0)}.",
+                Fore.MAGENTA,
+            )
 
-function terminar(estado, extras = {}) {
-    if (jaRespondeu) return;
-    jaRespondeu = true;
-    responder({ estado, fase, ...estatisticas, anotacoes: anotacoes.slice(0, 160), ...extras });
-}
-function registrar(mensagem) {
-    if (anotacoes.length < 160) anotacoes.push(String(mensagem));
-}
-function texto(el) { return (el && el.textContent || '').trim().replace(/\s+/g, ' '); }
-function normalizar(s) { return String(s || '').trim().toLocaleLowerCase('pt-BR'); }
-function visivel(el) {
-    if (!el || !el.isConnected) return false;
-    const cs = getComputedStyle(el);
-    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
-    return el.getClientRects().length > 0;
-}
-function esperar(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
-function restante() { return limiteMs - (performance.now() - inicio); }
-async function aguardarAte(fn, ms, intervalo = 120) {
-    const fim = performance.now() + ms;
-    for (;;) {
-        if (restante() < 2200) throw new Error('Limite de tempo da automacao atingido.');
-        const valor = fn();
-        if (valor) return valor;
-        if (performance.now() >= fim) return null;
-        await esperar(intervalo);
-    }
-}
-function seletorMascote() {
-    return Array.from(document.querySelectorAll('select.form-select.form-select-sm'))
-        .find(sel => visivel(sel) && Array.from(sel.options).some(op => op.value === 'mascote')) || null;
-}
-function raizChooser() {
-    const select = seletorMascote();
-    if (!select) return null;
-    const card = select.closest('.nitro-card') || select.closest('[class*="nitro-card"]');
-    // O filtro e as linhas podem estar em um unico painel; fallback para document.
-    if (card && card.querySelector('tr.rounded.p-1')) return card;
-    return document;
-}
-function linhasMascotes() {
-    const raiz = raizChooser();
-    if (!raiz) return [];
-    const linhas = Array.from(raiz.querySelectorAll('tr.rounded.p-1'));
-    return linhas.filter(tr => {
-        if (!visivel(tr)) return false;
-        const cols = tr.querySelectorAll('td');
-        if (cols.length < 2) return false;
-        const nome = tr.querySelector('td:first-child .d-inline.text-black.text-truncate');
-        return !!nome && !!texto(nome) && /mascote|planta/i.test(texto(cols[1]));
-    });
-}
-function nomeDaLinha(tr) {
-    return texto(tr && tr.querySelector('td:first-child .d-inline.text-black.text-truncate'));
-}
-function inventario() {
-    const ocorrencias = new Map();
-    return linhasMascotes().map((tr, indice) => {
-        const nome = nomeDaLinha(tr);
-        const chave = normalizar(nome);
-        const ocorrencia = ocorrencias.get(chave) || 0;
-        ocorrencias.set(chave, ocorrencia + 1);
-        return { nome, indice, ocorrencia, linhaOriginal: tr };
-    });
-}
-function localizarLinha(item) {
-    const linhas = linhasMascotes();
-    if (item.linhaOriginal && linhas.includes(item.linhaOriginal)) return item.linhaOriginal;
-    const naPosicao = linhas[item.indice];
-    if (naPosicao && normalizar(nomeDaLinha(naPosicao)) === normalizar(item.nome)) return naPosicao;
-    // Evita confundir itens com nomes repetidos. Só usa o mesmo ordinal de nome.
-    const iguais = linhas.filter(tr => normalizar(nomeDaLinha(tr)) === normalizar(item.nome));
-    return iguais[item.ocorrencia] || null;
-}
-function opcoes() {
-    const menu = Array.from(document.querySelectorAll('.nitro-context-menu.visible'))
-        .find(visivel);
-    const op = Array.from((menu || document).querySelectorAll('div.menu-item.list-item'))
-        .filter(visivel);
-    for (const el of op) {
-        const t = texto(el);
-        if (/^tratar$/i.test(t)) return { tipo: 'tratar', el };
-        const m = t.match(/^acarici(?:a|ar)\s*\(\s*(\d+)\s*\)$/i);
-        if (m) return { tipo: 'acariciar', el, quantidade: Number(m[1]) };
-    }
-    return null;
-}
-function clicar(el, descricao) {
-    if (!el || !el.isConnected) throw new Error('Elemento indisponivel: ' + descricao);
-    el.click();
-}
-async function abrirOpcoes(item, tentativas = 2) {
-    for (let i = 0; i < tentativas; i++) {
-        const linha = localizarLinha(item);
-        if (!linha) throw new Error('Mascote desapareceu da lista: ' + item.nome + ' #' + (item.ocorrencia + 1));
-        const nome = linha.querySelector('td:first-child .d-inline.text-black.text-truncate') || linha;
-        // O click no nome propaga para a tr, onde o chooser geralmente registra onClick.
-        clicar(nome, 'selecionar ' + item.nome);
-        await esperar(180);
-        const opcao = await aguardarAte(opcoes, 850);
-        if (opcao) return opcao;
-    }
-    return null;
-}
-async function consumirCarinhos(item, opcaoInicial) {
-    let opcao = opcaoInicial;
-    let cliques = 0;
-    const limiteCliques = 15;
-    while (cliques < limiteCliques) {
-        if (opcao && opcao.tipo !== 'acariciar') return cliques;
-        if (!opcao) {
-            opcao = await abrirOpcoes(item, 2);
-            if (!opcao || opcao.tipo !== 'acariciar') return cliques;
-        }
-        const antes = opcao.quantidade;
-        if (!Number.isInteger(antes) || antes < 1 || antes > 99) {
-            throw new Error('Contador Acaricia invalido: ' + antes);
-        }
-        clicar(opcao.el, 'Acaricia (' + antes + ')');
-        cliques++;
-        estatisticas.carinhos++;
-        await esperar(180);
-        // Verifica se o contador caiu ou se a opcao sumiu.
-        let nova = opcoes();
-        if (nova && nova.tipo === 'acariciar' && nova.quantidade >= antes) {
-            nova = await aguardarAte(() => {
-                const atual = opcoes();
-                return (!atual || atual.tipo !== 'acariciar' || atual.quantidade < antes) ? { atual } : null;
-            }, 1800);
-            nova = nova ? nova.atual : opcoes();
-        }
-        if (nova && nova.tipo === 'acariciar') {
-            if (nova.quantidade >= antes) {
-                throw new Error('Contador nao diminuiu de ' + antes + '; nao vou repetir clique incerto.');
-            }
-            opcao = nova;
-            continue;
-        }
-        // Alguns menus fecham apos cada clique; reabre para confirmar o contador.
-        const reaberto = await abrirOpcoes(item, 1);
-        if (!reaberto || reaberto.tipo !== 'acariciar') return cliques;
-        if (reaberto.quantidade >= antes) {
-            const diminuiu = await aguardarAte(() => {
-                const a = opcoes();
-                return a && a.tipo === 'acariciar' && a.quantidade < antes ? a : null;
-            }, 1350);
-            if (!diminuiu) throw new Error('Contador nao baixou apos reabrir o menu; sem repetir.');
-            opcao = diminuiu;
-        } else {
-            opcao = reaberto;
-        }
-    }
-    throw new Error('Limite de 15 cliques Acaricia atingido; interrompido por seguranca.');
-}
-function fecharChooser() {
-    const select = seletorMascote();
-    const card = select && (select.closest('.nitro-card') || select.closest('[class*="nitro-card"]'));
-    const botoes = Array.from(document.querySelectorAll(
-        'div.d-flex.position-absolute.align-items-center.justify-content-center.end-2.nitro-card-header-close, .nitro-card-header-close'
-    )).filter(visivel);
-    const botao = (card && botoes.find(el => card.contains(el))) || botoes[botoes.length - 1];
-    if (!botao) return false;
-    clicar(botao, 'fechar chooser');
-    return true;
-}
+        estado = status.get("estado", "")
+        if estado in ("concluido", "parcial", "erro"):
+            duracao = time.monotonic() - inicio
+            log(
+                f"[Conta {account_id}] TRATAR E CARINHOS {comando_id}: "
+                f"estado={estado}; processados={processados}/{total}; "
+                f"tratados={status.get('tratados', 0)}; "
+                f"carinhos={status.get('carinhos', 0)}; "
+                f"sem_acao={status.get('sem_acao', 0)}; "
+                f"erros={status.get('erros', 0)}; "
+                f"fechou={status.get('fechado', False)}; "
+                f"tempo={duracao:.1f}s.",
+                Fore.GREEN if estado == "concluido" else Fore.YELLOW,
+            )
+            if estado != "concluido" or not status.get("fechado"):
+                raise CarinhosIndeterminado(
+                    f"TRATAR E CARINHOS {comando_id}: processamento "
+                    f"{estado}; {processados}/{total} itens; "
+                    f"detalhes={status.get('detalhes', '')[:150]!r}. "
+                    "A parte ja executada nao sera repetida automaticamente."
+                )
+            return estado
 
-(async () => {
-    try {
-        fase = 'aguardando :chooser';
-        const seletor = await aguardarAte(seletorMascote, 12000);
-        if (!seletor) throw new Error('Seletor de tipos do chooser nao apareceu apos :chooser.');
-        fase = 'selecionando tipo mascote';
-        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-        setter.call(seletor, 'mascote');
-        seletor.dispatchEvent(new Event('input', { bubbles: true }));
-        seletor.dispatchEvent(new Event('change', { bubbles: true }));
-        registrar('Filtro mascote selecionado.');
-        await esperar(450);
-        if (seletor.value !== 'mascote') throw new Error('O filtro nao permaneceu em mascote.');
+        time.sleep(TRATAR_CARINHOS_POLL_SECONDS)
 
-        fase = 'carregando lista';
-        // A lista pode estar vazia. Aguarda ate 8s, sem misturar com outros tipos.
-        await aguardarAte(() => linhasMascotes().length > 0, 8000);
-        const itens = inventario();
-        estatisticas.total = itens.length;
-        registrar('Encontrados ' + itens.length + ' mascotes/plantas (nomes repetidos incluidos).');
-        if (itens.length > 150) throw new Error('Mais de 150 itens; interrompido por seguranca.');
-        if (!itens.length) {
-            fase = 'fechando chooser sem itens';
-            const fechado = fecharChooser();
-            terminar('sem_mascotes', { fechado });
-            return;
-        }
-        for (const item of itens) {
-            if (restante() < 4000) throw new Error('Tempo insuficiente para concluir toda a lista.');
-            fase = 'processando ' + item.nome + ' #' + (item.ocorrencia + 1);
-            try {
-                const opcao = await abrirOpcoes(item, 2);
-                if (!opcao) {
-                    estatisticas.sem_acao++;
-                    registrar(item.nome + ' #' + (item.ocorrencia + 1) + ': sem Tratar/Acaricia.');
-                } else if (opcao.tipo === 'tratar') {
-                    clicar(opcao.el, 'Tratar ' + item.nome);
-                    estatisticas.tratados++;
-                    registrar(item.nome + ' #' + (item.ocorrencia + 1) + ': tratado.');
-                    await esperar(220);
-                } else {
-                    const quantidade = await consumirCarinhos(item, opcao);
-                    registrar(item.nome + ' #' + (item.ocorrencia + 1) + ': ' + quantidade + ' carinho(s).');
-                }
-                estatisticas.processados++;
-            } catch (erroItem) {
-                estatisticas.erros++;
-                registrar(item.nome + ' #' + (item.ocorrencia + 1) + ': ERRO ' + String(erroItem?.message || erroItem));
-                // Item com resultado incerto fica sem repeticao; segue para o proximo.
-            }
-            await esperar(120);
-        }
-        fase = 'fechando chooser';
-        const fechado = fecharChooser();
-        terminar(estatisticas.erros ? 'parcial' : 'concluido', { fechado });
-    } catch (erro) {
-        try { fecharChooser(); } catch (_) {}
-        terminar('incompleto', { erro: String(erro?.message || erro), url: location.href });
-    }
-})();
-"""
+    raise CarinhosIndeterminado(
+        f"TRATAR E CARINHOS {comando_id}: limite de acompanhamento atingido "
+        "sem conclusao confirmada. Nao repetir automaticamente."
+    )
 
 
 # ---------- Ação: IR AO CAFOFO ----------
@@ -2122,6 +2141,11 @@ def iniciar_sessao(username, password, index):
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--incognito")
             options.add_argument("--window-size=1366,768")
+            # Minimiza a suspensao de timers internos (menu chooser, React)
+            # em navegadores headless que ficam abertos por longos periodos.
+            options.add_argument("--disable-background-timer-throttling")
+            options.add_argument("--disable-renderer-backgrounding")
+            options.add_argument("--disable-backgrounding-occluded-windows")
 
             service = Service(ChromeDriverManager().install())
             marcar_etapa(index, "Criando ChromeDriver...", Fore.CYAN)

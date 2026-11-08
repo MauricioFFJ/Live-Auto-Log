@@ -33,6 +33,8 @@ COMMANDS_PATH = "commands"
 COMMAND_MAX_AGE_SECONDS = 600  # comandos com mais de 10 minutos são ignorados
 COMMAND_MAX_ATTEMPTS = 5  # Legado: mantém compatibilidade com futuros comandos.
 CAFOFO_MAX_ATTEMPTS = max(1, int(os.getenv("CAFOFO_MAX_ATTEMPTS", "2")))
+RESPEITAR_MAX_ATTEMPTS = 1  # Nunca repetir automaticamente uma acao que consome respeitos.
+RESPEITAR_SCRIPT_TIMEOUT = max(85, int(os.getenv("RESPEITAR_SCRIPT_TIMEOUT", "105")))
 FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "1")))  # Evita várias tentativas longas em Chrome travado.
 CHAT_MAX_SIMULTANEOS = max(1, int(os.getenv("CHAT_MAX_SIMULTANEOS", "5")))  # Contas independentes: sem fila global por padrão.
 CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "25")))
@@ -114,7 +116,7 @@ def painel_status(account_ids):
                 # Um navegador ocioso/Online não está travado só porque passou
                 # algum tempo sem uma operação Selenium. Alertar apenas quando
                 # houver uma operação efetivamente em andamento.
-                operacao_ativa = (estado in ("💬 FALAR", "🏠 CAFOFO") or etapa.startswith(
+                operacao_ativa = (estado in ("💬 FALAR", "🏠 CAFOFO", "🤝 RESPEITAR") or etapa.startswith(
                     ("Sessão: consultando", "Criando ChromeDriver", "Abrindo", "Preenchendo")))
                 if ultima is not None and operacao_ativa:
                     sem_progresso = int(agora - ultima)
@@ -473,6 +475,383 @@ def enviar_mensagem(driver, account_id, mensagem, comando_id):
             sinalizar_falar(False)
 
 
+# ---------- Ação: RESPEITAR ----------
+class RespeitoIndeterminado(Exception):
+    """Parte do fluxo pode ter sido executada; repetir poderia consumir mais respeitos."""
+
+
+def respeitar_usuario(driver, account_id, nome_usuario, comando_id):
+    """Usa o FALAR funcional para :chooser e executa o fluxo no DOM do jogo.
+
+    Fluxo:
+      - :chooser no chat
+      - filtro exato por nome; ausência encerra sem clicar em outra pessoa
+      - Respeitar (X) até sumir, caso apareça primeiro
+      - Mais respeito -> Ok -> nome -> Respeitar (X) até sumir
+      - fechar chooser
+
+    Cada conta executa em sua própria thread. Um comando de RESPEITAR não é
+    repetido automaticamente, porque o navegador pode executar cliques mesmo
+    quando a resposta do ChromeDriver se perde.
+    """
+    nome_usuario = str(nome_usuario or "").strip()
+    if not nome_usuario or len(nome_usuario) > 60 or "\n" in nome_usuario or "\r" in nome_usuario:
+        raise ValueError("Nome do usuário inválido (limite: 60 caracteres, sem quebras de linha).")
+
+    inicio = time.monotonic()
+    marcar_etapa(account_id, f"RESPEITAR: abrindo :chooser para {nome_usuario!r}...",
+                 status="🤝 RESPEITAR")
+    try:
+        # Reutiliza EXATAMENTE a rotina FALAR que já funciona no Habblive.
+        enviar_mensagem(driver, account_id, ":chooser", f"{comando_id}:chooser")
+    except Exception as erro:
+        raise RespeitoIndeterminado(
+            f"RESPEITAR {comando_id}: resultado do :chooser incerto; "
+            f"não repetirei automaticamente ({type(erro).__name__}: {str(erro)[:180]})."
+        ) from erro
+
+    marcar_etapa(account_id,
+                 f"RESPEITAR: aguardando chooser, buscando {nome_usuario!r} e executando opções...",
+                 status="🤝 RESPEITAR")
+    try:
+        # A interação JS tem esperas assíncronas. O padrão Selenium é 30s;
+        # aumenta o timeout desta sessão para completar ambos os lotes.
+        driver.set_script_timeout(RESPEITAR_SCRIPT_TIMEOUT)
+        resposta = driver.execute_async_script(
+            RESPEITAR_JS,
+            nome_usuario,
+            (RESPEITAR_SCRIPT_TIMEOUT - 10) * 1000,
+        )
+    except Exception as erro:
+        raise RespeitoIndeterminado(
+            f"RESPEITAR {comando_id}: execução DOM sem resposta confirmada "
+            f"({type(erro).__name__}: {str(erro)[:220]}). "
+            "Não repetirei cliques de respeito automaticamente."
+        ) from erro
+
+    if not isinstance(resposta, dict):
+        raise RespeitoIndeterminado(
+            f"RESPEITAR {comando_id}: retorno inesperado do navegador: {resposta!r}"
+        )
+
+    for passo in resposta.get("trilha", []):
+        log(f"[Conta {account_id}] RESPEITAR: {passo}", Fore.CYAN)
+
+    estado = resposta.get("estado")
+    fase = resposta.get("fase")
+    tempo = time.monotonic() - inicio
+    anteriores = resposta.get("respeitosAntes", 0)
+    novos = resposta.get("respeitosDepois", 0)
+    if estado == "usuario_ausente":
+        log(
+            f"[Conta {account_id}] RESPEITAR {comando_id}: "
+            f"{nome_usuario!r} não apareceu na lista do chooser; nenhuma pessoa foi respeitada. "
+            f"Encerrado em {tempo:.1f}s.",
+            Fore.YELLOW,
+        )
+        marcar_etapa(account_id, "RESPEITAR: usuário ausente; finalizado.",
+                     Fore.YELLOW, status="✅ Online", registrar=False)
+        return "usuario_ausente"
+
+    if estado in ("concluido", "concluido_sem_fechar"):
+        log(
+            f"[Conta {account_id}] 🤝 RESPEITAR {comando_id}: "
+            f"{nome_usuario!r}; cliques normais={anteriores}; "
+            f"cliques após Mais respeito={novos}; "
+            f"Ok confirmado por clique no DOM; tempo={tempo:.1f}s. "
+            "A aceitação pelo servidor não foi verificada.",
+            Fore.GREEN,
+        )
+        if estado == "concluido_sem_fechar":
+            log(f"[Conta {account_id}] RESPEITAR: atenção, chooser não foi fechado.", Fore.YELLOW)
+        marcar_etapa(account_id, "RESPEITAR: fluxo DOM concluído.",
+                     Fore.GREEN, status="✅ Online", registrar=False)
+        return estado
+
+    raise RespeitoIndeterminado(
+        f"RESPEITAR {comando_id}: fluxo incompleto na fase {fase!r}; "
+        f"detalhe={resposta.get('erro', estado)!r}; "
+        f"normais={anteriores}; novos={novos}. "
+        "Não haverá repetição automática para evitar duplicação."
+    )
+
+
+RESPEITAR_JS = r"""
+// Executado por Selenium.execute_async_script, dentro da pagina do Big Client.
+// arguments[0]: nome exato; arguments[1]: limite de operacoes (ms).
+const nomeSolicitado = String(arguments[0] || '').trim();
+const limiteMs = Number(arguments[1]) || 70000;
+const finalizarSelenium = arguments[arguments.length - 1];
+const inicio = performance.now();
+const trilha = [];
+let fase = 'inicializacao';
+let houveClique = false;
+let anteriores = 0;
+let novos = 0;
+let maisComprado = false;
+let terminou = false;
+
+function encerrar(estado, detalhes = {}) {
+    if (terminou) return;
+    terminou = true;
+    finalizarSelenium({
+        estado,
+        fase,
+        nome: nomeSolicitado,
+        respeitosAntes: anteriores,
+        respeitosDepois: novos,
+        usouMaisRespeito: maisComprado,
+        houveClique,
+        tempoMs: Math.round(performance.now() - inicio),
+        trilha: trilha.slice(-45),
+        ...detalhes
+    });
+}
+function registrar(mensagem) {
+    trilha.push(mensagem);
+}
+function texto(el) {
+    return String(el?.textContent || '').replace(/\s+/g, ' ').trim();
+}
+function normalizar(valor) {
+    return String(valor || '').normalize('NFC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('pt-BR');
+}
+function visivel(el) {
+    if (!el || !el.isConnected) return false;
+    const estilo = getComputedStyle(el);
+    if (estilo.display === 'none' || estilo.visibility === 'hidden' ||
+        estilo.visibility === 'collapse' || estilo.pointerEvents === 'none') return false;
+    const caixa = el.getBoundingClientRect();
+    return caixa.width > 0 && caixa.height > 0;
+}
+function buscar(seletor) {
+    return Array.from(document.querySelectorAll(seletor)).find(visivel) || null;
+}
+function aguardar(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+function tempoRestante() {
+    return limiteMs - (performance.now() - inicio);
+}
+async function ate(fn, timeoutMs, intervalo = 140) {
+    const fim = performance.now() + timeoutMs;
+    while (true) {
+        if (tempoRestante() < 1000) throw new Error('Tempo geral da automacao esgotado.');
+        const resultado = fn();
+        if (resultado) return resultado;
+        if (performance.now() >= fim) return null;
+        await aguardar(intervalo);
+    }
+}
+function clicar(el, descricao) {
+    if (!visivel(el)) throw new Error(`Elemento deixou de estar visivel: ${descricao}`);
+    houveClique = true;
+    el.click();
+    registrar(`Clique: ${descricao}`);
+}
+function campoPesquisa() {
+    return buscar('input.form-control.form-control-sm[placeholder="Digite para procurar..."]') ||
+        buscar('input[placeholder="Digite para procurar..."]');
+}
+function inserirNome(campo) {
+    if (!campo || campo.disabled || campo.readOnly) throw new Error('Pesquisa do chooser bloqueada.');
+    campo.focus({preventScroll: true});
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(campo, nomeSolicitado);
+    try {
+        campo.dispatchEvent(new InputEvent('input', {bubbles: true, composed: true,
+            data: nomeSolicitado, inputType: 'insertText'}));
+    } catch (_) {
+        campo.dispatchEvent(new Event('input', {bubbles: true}));
+    }
+    campo.dispatchEvent(new Event('change', {bubbles: true}));
+    registrar(`Filtro preenchido: ${nomeSolicitado}`);
+}
+function buscarNome() {
+    // Comparacao exata: nunca selecionar outro usuario parecido com o nome desejado.
+    const filtro = campoPesquisa();
+    const painel = filtro && (filtro.closest('.nitro-card') || filtro.closest('[class*="nitro-card"]'));
+    const candidatos = Array.from(document.querySelectorAll('div.d-inline.text-black.text-truncate'))
+        .filter(el => visivel(el) && normalizar(texto(el)) === normalizar(nomeSolicitado));
+    if (!candidatos.length) return null;
+    if (painel) return candidatos.find(el => painel.contains(el)) || null;
+    return candidatos[0];
+}
+function encontrarRespeitar() {
+    for (const el of document.querySelectorAll('div.menu-item.list-item')) {
+        if (!visivel(el)) continue;
+        const m = texto(el).match(/^Respeitar\s*\(\s*(\d+)\s*\)$/i);
+        if (m) return {elemento: el, restante: Number(m[1])};
+    }
+    return null;
+}
+function encontrarMaisRespeito() {
+    return Array.from(document.querySelectorAll('div.menu-item.list-item'))
+        .find(el => visivel(el) && /^Mais respeito$/i.test(texto(el))) || null;
+}
+function encontrarOk() {
+    return Array.from(document.querySelectorAll('div.btn.btn-primary.btn-sm.btn-green'))
+        .find(el => visivel(el) && /^ok$/i.test(texto(el))) || null;
+}
+async function abrirOpcoes(tentativas = 4) {
+    // Quando uma opcao ja estiver aberta, nao clicar no nome (poderia fecha-la).
+    if (encontrarRespeitar() || encontrarMaisRespeito()) return true;
+    for (let i = 0; i < tentativas; i++) {
+        const nome = await ate(buscarNome, 2000);
+        if (!nome) return false;
+        clicar(nome, `usuario ${nomeSolicitado} (${i + 1}/${tentativas})`);
+        const abriu = await ate(() => encontrarRespeitar() || encontrarMaisRespeito(), 1200);
+        if (abriu) return true;
+        await aguardar(170);
+    }
+    return false;
+}
+async function consumirDisponiveis(grupo, obrigatorio) {
+    fase = `respeitar: consumindo ${grupo}`;
+    const aberto = await abrirOpcoes();
+    if (!aberto) {
+        if (!obrigatorio) return 0;
+        throw new Error(`Nao foi possivel abrir menu de respeito (${grupo}).`);
+    }
+    let cliques = 0;
+    let ultimoRestante = null;
+    for (let i = 0; i < 12; i++) {
+        let botao = encontrarRespeitar();
+        if (!botao) {
+            // Pode ter fechado o menu depois do clique anterior.
+            const pronto = await abrirOpcoes(3);
+            botao = encontrarRespeitar();
+            if (!botao) {
+                if (!pronto && obrigatorio && cliques === 0) {
+                    throw new Error(`Menu de respeito sumiu sem nenhum clique (${grupo}).`);
+                }
+                registrar(`Respeitar ausente no grupo ${grupo} apos ${cliques} clique(s)`);
+                return cliques;
+            }
+        }
+        if (botao.restante <= 0) return cliques;
+        if (ultimoRestante !== null && botao.restante >= ultimoRestante) {
+            // Evita clicar novamente no mesmo X se a interface nao confirmou alteracao.
+            const mudou = await ate(() => {
+                const atual = encontrarRespeitar();
+                return !atual || atual.restante < ultimoRestante;
+            }, 1700);
+            if (!mudou) throw new Error(`Contador Respeitar nao diminuiu em ${grupo}: ${botao.restante}.`);
+            botao = encontrarRespeitar();
+            if (!botao) continue;
+        }
+        const antes = botao.restante;
+        clicar(botao.elemento, `Respeitar (${antes}) - ${grupo}`);
+        cliques += 1;
+        ultimoRestante = antes;
+        // Aguarda a mudanca de contador ou desaparecimento para nao enviar cliques em rajada.
+        const atualizou = await ate(() => {
+            const atual = encontrarRespeitar();
+            return !atual || atual.restante < antes;
+        }, 2300);
+        if (!atualizou) {
+            throw new Error(`Clique Respeitar (${antes}) sem atualizacao confirmada em ${grupo}.`);
+        }
+        await aguardar(160);
+    }
+    throw new Error(`Limite de 12 cliques atingido em ${grupo}; interrompido por seguranca.`);
+}
+async function esperarMaisRespeito() {
+    fase = 'respeitar: localizando Mais respeito';
+    const aberto = await abrirOpcoes(5);
+    if (!aberto) throw new Error('Menu Mais respeito nao apareceu ao selecionar o usuario.');
+    const mais = encontrarMaisRespeito();
+    if (mais) return mais;
+    // O ultimo Respeitar pode estar em processamento; aguarda e reabre menu.
+    const sumiu = await ate(() => !encontrarRespeitar(), 2200);
+    if (!sumiu) throw new Error('Ainda ha Respeitar (X); nao vou abrir Mais respeito.');
+    await abrirOpcoes(3);
+    const resultado = encontrarMaisRespeito();
+    if (!resultado) throw new Error('Mais respeito nao apareceu depois dos respeitos normais.');
+    return resultado;
+}
+function fecharChooser() {
+    const campo = campoPesquisa();
+    const cartao = campo && (campo.closest('.nitro-card') || campo.closest('[class*="nitro-card"]'));
+    const botoes = Array.from(document.querySelectorAll(
+        'div.d-flex.position-absolute.align-items-center.justify-content-center.end-2.nitro-card-header-close, .nitro-card-header-close'
+    )).filter(visivel);
+    const alvo = (cartao && botoes.find(btn => cartao.contains(btn))) || botoes[botoes.length - 1];
+    if (!alvo) { registrar('Aviso: botao de fechar chooser nao encontrado'); return false; }
+    clicar(alvo, 'fechar chooser');
+    return true;
+}
+
+(async () => {
+    try {
+        if (!nomeSolicitado || nomeSolicitado.length > 60) {
+            throw new Error('Nome do usuario invalido ou com mais de 60 caracteres.');
+        }
+        fase = 'aguardando janela chooser';
+        const campo = await ate(campoPesquisa, 10000);
+        if (!campo) throw new Error('Campo "Digite para procurar..." nao apareceu. :chooser pode nao ter aberto.');
+        inserirNome(campo);
+        fase = 'aguardando usuario na lista';
+        const nome = await ate(buscarNome, 7000);
+        if (!nome) {
+            registrar(`Usuario ${nomeSolicitado} nao esta presente na lista`);
+            fecharChooser();
+            encerrar('usuario_ausente');
+            return;
+        }
+        clicar(nome, `selecionar ${nomeSolicitado}`);
+        await aguardar(220);
+        fase = 'avaliando menu inicial';
+        const menuInicial = await ate(() => encontrarRespeitar() || encontrarMaisRespeito(), 2400);
+        if (!menuInicial) {
+            const abriu = await abrirOpcoes(3);
+            if (!abriu) throw new Error('Menu de usuario nao mostrou Respeitar nem Mais respeito.');
+        }
+        if (encontrarRespeitar()) {
+            anteriores = await consumirDisponiveis('antes do Mais respeito', true);
+        } else if (encontrarMaisRespeito()) {
+            registrar('Mais respeito disponivel desde a primeira selecao.');
+        } else {
+            throw new Error('Menu inicial nao possui Respeitar nem Mais respeito.');
+        }
+
+        const mais = await esperarMaisRespeito();
+        fase = 'clicando Mais respeito';
+        clicar(mais, 'Mais respeito');
+        fase = 'aguardando confirmacao Ok';
+        const ok = await ate(encontrarOk, 5500);
+        if (!ok) throw new Error('Botao verde Ok nao apareceu apos Mais respeito.');
+        clicar(ok, 'Ok (confirmar Mais respeito)');
+        maisComprado = true;
+        registrar('Confirmacao Ok clicada');
+        await aguardar(450);
+
+        fase = 'respeitar: reabrindo usuario apos Ok';
+        const nomeDepois = await ate(buscarNome, 4000);
+        if (!nomeDepois) throw new Error('Nome do usuario desapareceu apos confirmar Mais respeito.');
+        // O usuario pediu um novo clique no nome apos a compra.
+        if (!encontrarRespeitar()) clicar(nomeDepois, `reabrir ${nomeSolicitado} apos Ok`);
+        await aguardar(220);
+        novos = await consumirDisponiveis('depois do Mais respeito', true);
+        if (novos === 0) throw new Error('Nenhum respeito novo foi usado depois de Mais respeito.');
+
+        fase = 'fechando chooser';
+        const fechou = fecharChooser();
+        if (!fechou) {
+            encerrar('concluido_sem_fechar', {aviso: 'Respeitos enviados, mas botao fechar nao apareceu.'});
+            return;
+        }
+        encerrar('concluido');
+    } catch (erro) {
+        encerrar('incompleto', {
+            erro: String(erro?.message || erro),
+            url: location.href
+        });
+    }
+})();
+"""
+
+
 # ---------- Ação: IR AO CAFOFO ----------
 CASA_CSS = ".cursor-pointer.navigation-item.icon.icon-house"
 HABBO_CSS = ".cursor-pointer.navigation-item.icon.icon-habbo"
@@ -692,13 +1071,14 @@ def processar_comando_da_fila(driver, account_id):
         fila.put((comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos))
         return
 
-    nome_acao = "FALAR" if acao == "say" else "CAFOFO"
-    status_acao = "💬 FALAR" if acao == "say" else "🏠 CAFOFO"
+    nome_acao = {"say": "FALAR", "go_home": "CAFOFO", "respect": "RESPEITAR"}.get(acao, acao)
+    status_acao = {"say": "💬 FALAR", "go_home": "🏠 CAFOFO", "respect": "🤝 RESPEITAR"}.get(acao, "🔄 Executando")
     if agora - criado_timestamp > COMMAND_MAX_AGE_SECONDS:
         log(f"[Conta {account_id}] {nome_acao} {comando_id} expirou.", Fore.YELLOW)
         return
 
-    max_tentativas = FALAR_MAX_ATTEMPTS if acao == "say" else CAFOFO_MAX_ATTEMPTS
+    max_tentativas = {"say": FALAR_MAX_ATTEMPTS, "go_home": CAFOFO_MAX_ATTEMPTS,
+                      "respect": RESPEITAR_MAX_ATTEMPTS}.get(acao, 1)
     tentativa_atual = tentativas + 1
     marcar_etapa(
         account_id,
@@ -712,6 +1092,8 @@ def processar_comando_da_fila(driver, account_id):
             enviar_mensagem(driver, account_id, mensagem, comando_id)
         elif acao == "go_home":
             ir_ao_cafofo(driver, account_id, comando_id)
+        elif acao == "respect":
+            respeitar_usuario(driver, account_id, mensagem, comando_id)
         else:
             raise ValueError(f"Ação desconhecida na fila: {acao!r}")
 
@@ -724,14 +1106,20 @@ def processar_comando_da_fila(driver, account_id):
                 "(recebimento pelo servidor não confirmado).",
                 Fore.GREEN,
             )
-        else:
+        elif acao == "go_home":
             log(
                 f"[Conta {account_id}] ✅ CAFOFO {comando_id}: clique realizado "
                 "(navegação final não confirmada).",
                 Fore.GREEN,
             )
+        elif acao == "respect":
+            log(
+                f"[Conta {account_id}] ✅ RESPEITAR {comando_id}: "
+                "processamento do chooser finalizado nesta conta.",
+                Fore.GREEN,
+            )
 
-    except (EnterIndeterminado, CliqueIndeterminado) as erro:
+    except (EnterIndeterminado, CliqueIndeterminado, RespeitoIndeterminado) as erro:
         # Não repetir ações que podem já ter acontecido (ENTER ou clique).
         marcar_etapa(
             account_id, f"{nome_acao}: resultado da ação indeterminado.",
@@ -830,16 +1218,20 @@ def monitorar_comandos(account_ids):
                     conhecidos.add(nome)
 
                     acao = str(comando.get("action", ""))
-                    if acao not in ("say", "go_home"):
+                    if acao not in ("say", "go_home", "respect"):
                         continue
 
-                    mensagem = str(comando.get("message", "")) if acao == "say" else ""
+                    mensagem = (str(comando.get("message", "")) if acao == "say" else
+                                str(comando.get("target_name", "")).strip() if acao == "respect" else "")
                     alvos = set(int(item) for item in comando.get("targets", []))
                     alvos_locais = alvos.intersection(account_ids_set)
 
                     if not alvos_locais:
                         continue
                     if acao == "say" and (not mensagem or len(mensagem) > 100):
+                        continue
+                    if acao == "respect" and (not mensagem or len(mensagem) > 60 or "\n" in mensagem or "\r" in mensagem):
+                        log(f"Comando RESPEITAR inválido ou sem nome de usuário: {nome}", Fore.YELLOW)
                         continue
 
                     data_criacao = comando.get("created_at")
@@ -878,7 +1270,7 @@ def monitorar_comandos(account_ids):
                         comandos_concluidos.setdefault(comando_id, set())
 
                     log(
-                        f"Novo comando {'FALAR' if acao == 'say' else 'CAFOFO'} recebido "
+                        f"Novo comando { {'say': 'FALAR', 'go_home': 'CAFOFO', 'respect': 'RESPEITAR'}[acao] } recebido "
                         f"({comando_id}) para contas {sorted(alvos_locais)}.",
                         Fore.CYAN
                     )

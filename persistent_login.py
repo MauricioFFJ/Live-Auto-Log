@@ -31,7 +31,8 @@ CHECK_INTERVAL = max(15, int(os.getenv("SESSION_CHECK_INTERVAL", "60")))
 COMMAND_POLL_INTERVAL = max(5, int(os.getenv("COMMAND_POLL_INTERVAL", "10")))
 COMMANDS_PATH = "commands"
 COMMAND_MAX_AGE_SECONDS = 600  # comandos com mais de 10 minutos são ignorados
-COMMAND_MAX_ATTEMPTS = 5  # Mantido para ações diferentes de FALAR.
+COMMAND_MAX_ATTEMPTS = 5  # Legado: mantém compatibilidade com futuros comandos.
+CAFOFO_MAX_ATTEMPTS = max(1, int(os.getenv("CAFOFO_MAX_ATTEMPTS", "2")))
 FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "1")))  # Evita várias tentativas longas em Chrome travado.
 CHAT_MAX_SIMULTANEOS = max(1, int(os.getenv("CHAT_MAX_SIMULTANEOS", "5")))  # Contas independentes: sem fila global por padrão.
 CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "25")))
@@ -510,49 +511,169 @@ def clicar_icone_com_seguranca(driver, elemento, descricao):
 
 
 def ir_ao_cafofo(driver, account_id, comando_id):
-    """Casa direta; se ausente, abre o menu Habbo e clica na casa exibida."""
+    """Abre o CAFOFO via DOM JavaScript em UMA chamada ao navegador.
+
+    Se houver casa visível, clica diretamente. Senão, clica no ícone Habbo,
+    aguarda a casa ficar visível e então clica nela. O resultado informa
+    o que foi realmente executado no DOM, não garante a navegação no servidor.
+
+    Não usa WebElement.click/is_displayed/WebDriverWait: chamadas desse tipo
+    ficaram bloqueadas por muito tempo nos logs do usuário.
+    """
     inicio = time.monotonic()
-    marcar_etapa(account_id, "CAFOFO: procurando ícone da casa...", status="🏠 CAFOFO")
+    marcar_etapa(
+        account_id,
+        "CAFOFO: executando casa direta ou Habbo → casa via JavaScript...",
+        status="🏠 CAFOFO",
+    )
 
-    # Regra principal: se a casa já está disponível, não abrir o menu Habbo.
-    casa = localizar_icone_visivel(driver, CASA_CSS)
-    if casa is not None:
-        marcar_etapa(account_id, "CAFOFO: casa encontrada; clicando...")
-        metodo = clicar_icone_com_seguranca(driver, casa, "ícone da casa")
-        log(
-            f"[Conta {account_id}] 🏠 CAFOFO {comando_id}: ícone da casa clicado "
-            f"diretamente ({metodo}; {time.monotonic()-inicio:.1f}s).",
-            Fore.GREEN,
+    # O timeout padrão de script assíncrono do Selenium é 30s.
+    # Limitamos a espera dentro da página para não ultrapassar esse padrão.
+    espera_ms = max(2000, min(CAFOFO_HOUSE_TIMEOUT * 1000, 18000))
+    script = r"""
+        const esperaMs = arguments[0];
+        const concluir = arguments[arguments.length - 1];
+        const seletorCasa = 'div.cursor-pointer.navigation-item.icon.icon-house';
+        const seletorHabbo = 'div.cursor-pointer.navigation-item.icon.icon-habbo';
+        const inicio = performance.now();
+        let concluido = false;
+        let menuClicado = false;
+        let fase = 'procurando casa';
+
+        function finalizar(estado, detalhes = {}) {
+            if (concluido) return;
+            concluido = true;
+            concluir({
+                estado,
+                fase,
+                menuClicado,
+                decorridoMs: Math.round(performance.now() - inicio),
+                ...detalhes
+            });
+        }
+
+        function estaVisivel(elemento) {
+            if (!elemento || !elemento.isConnected) return false;
+            const estilo = getComputedStyle(elemento);
+            if (estilo.display === 'none' ||
+                estilo.visibility === 'hidden' ||
+                estilo.visibility === 'collapse' ||
+                estilo.pointerEvents === 'none') return false;
+            const retangulo = elemento.getBoundingClientRect();
+            return retangulo.width > 0 && retangulo.height > 0;
+        }
+
+        function acharVisivel(seletor) {
+            const elementos = Array.from(document.querySelectorAll(seletor))
+                .filter(estaVisivel);
+            if (!elementos.length) return null;
+            // Caso existam vários ícones, favorece o mais central.
+            elementos.sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                const da = Math.abs(ra.left + ra.width / 2 - innerWidth / 2);
+                const db = Math.abs(rb.left + rb.width / 2 - innerWidth / 2);
+                return da - db;
+            });
+            return elementos[0];
+        }
+
+        try {
+            const casaDireta = acharVisivel(seletorCasa);
+            if (casaDireta) {
+                fase = 'clicando casa diretamente';
+                casaDireta.click();
+                finalizar('casa_direta');
+                return;
+            }
+
+            fase = 'procurando menu Habbo';
+            const habbo = acharVisivel(seletorHabbo);
+            if (!habbo) {
+                finalizar('menu_ausente', {
+                    motivo: 'Nem a casa nem o ícone Habbo estão visíveis neste documento.'
+                });
+                return;
+            }
+
+            fase = 'clicando menu Habbo';
+            habbo.click();
+            menuClicado = true;
+            fase = 'aguardando casa após menu Habbo';
+
+            function tentarCasa() {
+                if (concluido) return;
+                try {
+                    const casa = acharVisivel(seletorCasa);
+                    if (casa) {
+                        fase = 'clicando casa após Habbo';
+                        casa.click();
+                        finalizar('menu_e_casa');
+                        return;
+                    }
+                    if (performance.now() - inicio >= esperaMs) {
+                        finalizar('casa_nao_apareceu', {
+                            motivo: 'O menu Habbo recebeu um click, mas a casa não apareceu a tempo.'
+                        });
+                        return;
+                    }
+                    setTimeout(tentarCasa, 120);
+                } catch (erro) {
+                    finalizar('erro_js', {motivo: String(erro)});
+                }
+            }
+            setTimeout(tentarCasa, 120);
+        } catch (erro) {
+            finalizar('erro_js', {motivo: String(erro)});
+        }
+    """
+
+    try:
+        resposta = driver.execute_async_script(script, espera_ms)
+    except Exception as erro:
+        # Uma resposta perdida pode significar que o clique já foi executado.
+        # Não repetimos automaticamente para não reabrir/fechar o menu.
+        raise CliqueIndeterminado(
+            f"CAFOFO {comando_id}: ChromeDriver não confirmou a execução JS "
+            f"({type(erro).__name__}: {str(erro)[:220]})."
+        ) from erro
+
+    if not isinstance(resposta, dict):
+        raise CliqueIndeterminado(
+            f"CAFOFO {comando_id}: resposta inesperada do navegador: {resposta!r}"
         )
-        marcar_etapa(account_id, "CAFOFO: clique direto realizado.", Fore.GREEN,
-                     status="✅ Online", registrar=False)
-        return
 
-    # Plano B: a casa não aparece neste momento; abra o menu Habbo.
-    marcar_etapa(account_id, "CAFOFO: casa ausente; procurando menu Habbo...")
-    habbo = WebDriverWait(driver, CAFOFO_MENU_TIMEOUT, poll_frequency=0.6).until(
-        lambda d: localizar_icone_visivel(d, HABBO_CSS)
+    estado = resposta.get('estado')
+    tempo = time.monotonic() - inicio
+    if estado == 'casa_direta':
+        log(
+            f"[Conta {account_id}] 🏠 CAFOFO {comando_id}: casa clicada "
+            f"diretamente via JavaScript em {tempo:.1f}s.", Fore.GREEN
+        )
+    elif estado == 'menu_e_casa':
+        log(
+            f"[Conta {account_id}] 🏠 CAFOFO {comando_id}: menu Habbo → "
+            f"casa clicada via JavaScript em {tempo:.1f}s.", Fore.GREEN
+        )
+    elif estado == 'menu_ausente':
+        raise RuntimeError(
+            f"CAFOFO {comando_id}: casa e menu Habbo ausentes/ocultos. "
+            "Verifique a interface do cliente."
+        )
+    else:
+        # Se o menu foi acionado, repetir o comando pode fechá-lo novamente.
+        erro = resposta.get('motivo', 'Resultado não confirmado.')
+        if resposta.get('menuClicado') or estado == 'erro_js':
+            raise CliqueIndeterminado(
+                f"CAFOFO {comando_id}: estado={estado}; fase={resposta.get('fase')}; "
+                f"detalhes={erro}. Sem repetição automática."
+            )
+        raise RuntimeError(f"CAFOFO {comando_id}: estado={estado}; {erro}")
+
+    marcar_etapa(
+        account_id, "CAFOFO: ação de clique concluída via JavaScript.",
+        Fore.GREEN, status="✅ Online", registrar=False
     )
-
-    marcar_etapa(account_id, "CAFOFO: abrindo menu Habbo...")
-    metodo_menu = clicar_icone_com_seguranca(driver, habbo, "menu Habbo")
-    log(f"[Conta {account_id}] CAFOFO: menu Habbo aberto ({metodo_menu}).", Fore.CYAN)
-
-    # O menu pode animar; aguarda o ícone aparecer e ficar interativo.
-    marcar_etapa(account_id, "CAFOFO: aguardando ícone central da casa...")
-    casa = WebDriverWait(driver, CAFOFO_HOUSE_TIMEOUT, poll_frequency=0.6).until(
-        lambda d: localizar_icone_visivel(d, CASA_CSS)
-    )
-
-    marcar_etapa(account_id, "CAFOFO: clicando na casa após abrir Habbo...")
-    metodo_casa = clicar_icone_com_seguranca(driver, casa, "casa após menu Habbo")
-    log(
-        f"[Conta {account_id}] 🏠 CAFOFO {comando_id}: menu Habbo → casa "
-        f"({metodo_casa}; {time.monotonic()-inicio:.1f}s).",
-        Fore.GREEN,
-    )
-    marcar_etapa(account_id, "CAFOFO: clique após menu realizado.", Fore.GREEN,
-                 status="✅ Online", registrar=False)
 
 
 def processar_comando_da_fila(driver, account_id):
@@ -577,7 +698,7 @@ def processar_comando_da_fila(driver, account_id):
         log(f"[Conta {account_id}] {nome_acao} {comando_id} expirou.", Fore.YELLOW)
         return
 
-    max_tentativas = FALAR_MAX_ATTEMPTS if acao == "say" else COMMAND_MAX_ATTEMPTS
+    max_tentativas = FALAR_MAX_ATTEMPTS if acao == "say" else CAFOFO_MAX_ATTEMPTS
     tentativa_atual = tentativas + 1
     marcar_etapa(
         account_id,

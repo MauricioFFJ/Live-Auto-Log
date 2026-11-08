@@ -1,4 +1,4 @@
-name: VISITAR QUARTO
+name: (Comando) Visitar quarto
 
 on:
   workflow_dispatch:

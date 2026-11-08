@@ -32,15 +32,15 @@ COMMAND_POLL_INTERVAL = max(5, int(os.getenv("COMMAND_POLL_INTERVAL", "10")))
 COMMANDS_PATH = "commands"
 COMMAND_MAX_AGE_SECONDS = 600  # comandos com mais de 10 minutos são ignorados
 COMMAND_MAX_ATTEMPTS = 5  # Mantido para ações diferentes de FALAR.
-FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "2")))
-CHAT_MAX_SIMULTANEOS = 1  # Intencional: evita saturação ao digitar em 5 Chromes.
-CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "35")))
+FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "1")))  # Evita várias tentativas longas em Chrome travado.
+CHAT_MAX_SIMULTANEOS = max(1, int(os.getenv("CHAT_MAX_SIMULTANEOS", "5")))  # Contas independentes: sem fila global por padrão.
+CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "25")))
 COMMAND_RETRY_DELAY_SECONDS = max(1, int(os.getenv("COMMAND_RETRY_DELAY_SECONDS", "15")))
 CHAT_FIELD_TIMEOUT = max(3, int(os.getenv("CHAT_FIELD_TIMEOUT", "8")))
 CAFOFO_MENU_TIMEOUT = max(3, int(os.getenv("CAFOFO_MENU_TIMEOUT", "12")))
 CAFOFO_HOUSE_TIMEOUT = max(3, int(os.getenv("CAFOFO_HOUSE_TIMEOUT", "15")))
-# A leitura do valor digitado acrescenta uma chamada ao Selenium; desligada
-# para priorizar velocidade, mas pode ser reativada se houver inconsistências.
+# Legado: mantida para compatibilidade de configuração externa, o modo direto
+# já verifica o valor durante o único execute_script.
 CHAT_CONFIRMAR_TEXTO = os.getenv("CHAT_CONFIRMAR_TEXTO", "0").lower() in ("1", "true", "yes")
 DEBUG_SESSAO = os.getenv("DEBUG_SESSAO", "0").strip().lower() not in ("0", "false", "no")
 EXECUTAR_ACOES = False  # True = faz ações no quarto, False = só loga/reloga
@@ -60,10 +60,23 @@ comandos_concluidos = {}  # IDs concluídos por conta.
 ultima_atividade = {}  # Momento da última etapa concluída/iniciada por conta.
 etapa_atividade = {}  # Etapa Selenium em andamento para localizar travamentos.
 
-# Só um FALAR por vez no mesmo runner (configurável) evita saturar
-# cinco navegadores com as mesmas operações pesadas do WebDriver.
+# Cada Selenium é exclusivo da thread de sua conta. A configuração permite
+# até 5 envios simultâneos sem formar uma fila única no runner.
 semaforo_falar = threading.BoundedSemaphore(CHAT_MAX_SIMULTANEOS)
-falar_ativo = threading.Event()  # Evita verificações de sessão durante o envio.
+falar_ativo = threading.Event()
+contador_falar = 0
+lock_contador_falar = threading.Lock()
+
+
+def sinalizar_falar(iniciando):
+    """A flag só é desligada quando TODAS as contas terminarem o FALAR."""
+    global contador_falar
+    with lock_contador_falar:
+        contador_falar = max(0, contador_falar + (1 if iniciando else -1))
+        if contador_falar > 0:
+            falar_ativo.set()
+        else:
+            falar_ativo.clear()
 
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
 GITHUB_TOKEN = os.getenv("COMMAND_GITHUB_TOKEN", "") or os.getenv("GITHUB_TOKEN", "")
@@ -327,30 +340,22 @@ def diagnosticar_chat(driver, account_id):
 
 def enviar_mensagem(driver, account_id, mensagem, comando_id):
     """
-    FALAR otimizado para Chrome sob carga:
-    - Sem campo.click() (operação que travou por 120s nos logs).
-    - Sem campo.clear() (outra requisição remota).
-    - send_keys(Ctrl+A, texto) foca o input e substitui o conteúdo.
-    - ENTER separado para detectar resultado incerto sem duplicação automática.
-    - Limita o número de FALAR simultâneos por runner.
-    - Timeout HTTP específico do período de envio (se Selenium suportar).
+    Caminho rápido para o chat:
+      1. UMA chamada JS encontra/foca o input, altera o value pelo setter
+         nativo e dispara 'input', para atualizar React/Vue quando aplicável.
+      2. Chrome DevTools Protocol envia Enter com eventos de teclado reais.
+
+    Não usa WebElement.click/clear/send_keys, os pontos que ficaram presos nos logs.
+    Cada conta usa exclusivamente sua thread; até 5 FALAR paralelos no runner.
     """
     if not mensagem or len(mensagem) > 100:
         raise ValueError("Mensagem vazia ou maior que 100 caracteres.")
 
     inicio = time.monotonic()
-    marcar_etapa(
-        account_id,
-        "FALAR: aguardando vez (evitando sobrecarga dos Chromes)...",
-        status="💬 FALAR",
-    )
+    marcar_etapa(account_id, "FALAR: iniciando envio direto...", status="💬 FALAR")
 
-    # O monitor já distribuiu o comando à thread da conta: esta espera não
-    # toca no WebDriver e não bloqueia outros serviços.
     with semaforo_falar:
-        espera = time.monotonic() - inicio
-        falar_ativo.set()
-
+        sinalizar_falar(True)
         executor = getattr(driver, "command_executor", None)
         client_config = getattr(executor, "client_config", None)
         timeout_original = None
@@ -364,64 +369,98 @@ def enviar_mensagem(driver, account_id, mensagem, comando_id):
                 pass
 
         try:
-            inicio_chrome = time.monotonic()
+            marcar_etapa(account_id, "FALAR: localizando e preenchendo chat via JavaScript...")
+            # Usa setter nativo: el.value = ... isoladamente pode não notificar
+            # os componentes controlados do React. 'input' também atende Vue.
+            preparar_chat = r"""
+                const texto = arguments[0];
+                const seletor = 'input.chat-input[placeholder="Fale aqui..."]';
+                const campo = document.querySelector(seletor)
+                    || Array.from(document.querySelectorAll('input.chat-input'))
+                       .find(e => !e.disabled && !e.readOnly);
+                if (!campo) {
+                    return {status: 'ausente', url: location.href};
+                }
+                if (campo.disabled || campo.readOnly) {
+                    return {status: 'indisponivel', url: location.href};
+                }
+                campo.focus({preventScroll: true});
+                const setValue = Object.getOwnPropertyDescriptor(
+                    HTMLInputElement.prototype, 'value').set;
+                setValue.call(campo, texto);
+                try {
+                    campo.dispatchEvent(new InputEvent('input', {
+                        bubbles: true, composed: true, inputType: 'insertText', data: texto
+                    }));
+                } catch (_) {
+                    campo.dispatchEvent(new Event('input', {bubbles: true}));
+                }
+                campo.dispatchEvent(new Event('change', {bubbles: true}));
+                return {
+                    status: 'preparado',
+                    textoCorreto: campo.value === texto,
+                    focado: document.activeElement === campo,
+                    url: location.href
+                };
+            """
+            # Não repetir a preparação se houve timeout HTTP: o resultado da
+            # operação é incerto, mas nenhum Enter foi pressionado nesta tentativa.
+            resposta = driver.execute_script(preparar_chat, mensagem)
+            if not isinstance(resposta, dict):
+                raise RuntimeError(f"Resposta inesperada do chat: {resposta!r}")
+            if resposta.get('status') != 'preparado':
+                raise RuntimeError(
+                    f"Chat não disponível ({resposta.get('status')}); "
+                    f"URL={resposta.get('url')!r}. Verifique se está dentro do quarto."
+                )
+            if not resposta.get('textoCorreto') or not resposta.get('focado'):
+                raise RuntimeError(
+                    "Chat localizado, mas o valor/foco não foi confirmado; "
+                    "não vou disparar Enter sem essa confirmação."
+                )
+            preparado = time.monotonic()
             marcar_etapa(
                 account_id,
-                f"FALAR: procurando chat (aguardou {espera:.1f}s na fila)...",
-            )
-            seletor = "input.chat-input[placeholder='Fale aqui...']"
-            campo = WebDriverWait(
-                driver, CHAT_FIELD_TIMEOUT, poll_frequency=0.4
-            ).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, seletor))
-            )
-            localizado = time.monotonic()
-            marcar_etapa(
-                account_id,
-                f"FALAR: campo encontrado em {localizado - inicio_chrome:.1f}s; "
-                "digitando SEM clicar...",
+                f"FALAR: texto preparado em {preparado-inicio:.1f}s; "
+                "enviando ENTER via Chrome...",
                 Fore.GREEN,
             )
 
-            # WebElement.send_keys cuida do foco. Ctrl+A substitui eventual
-            # texto antigo. Não usamos click/clear nem eventos sintéticos JS.
-            campo.send_keys(Keys.CONTROL + "a", mensagem)
-            digitado = time.monotonic()
-            marcar_etapa(
-                account_id,
-                "FALAR: texto enviado ao campo; pressionando ENTER...",
-            )
-
-            if CHAT_CONFIRMAR_TEXTO:
-                texto_atual = campo.get_attribute("value")
-                if texto_atual != mensagem:
-                    raise RuntimeError(
-                        "Conteúdo do chat não corresponde ao texto pedido."
-                    )
-
+            enter_args = {
+                'key': 'Enter', 'code': 'Enter',
+                'windowsVirtualKeyCode': 13, 'nativeVirtualKeyCode': 13,
+            }
+            # 'keyDown' com texto envia os eventos padrão de teclado do Chrome,
+            # diferentemente de KeyboardEvent artificial (isTrusted=false).
             try:
-                campo.send_keys(Keys.ENTER)
+                driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                    **enter_args, 'type': 'keyDown', 'text': '\r', 'unmodifiedText': '\r',
+                })
             except Exception as erro:
-                # Um timeout durante ENTER não revela se a mensagem saiu.
-                # Repetir automaticamente poderia mandar duas mensagens.
                 raise EnterIndeterminado(
-                    f"Não foi possível confirmar ENTER de {comando_id}: "
-                    f"{type(erro).__name__}: {str(erro)[:220]}"
+                    f"ENTER keyDown teve resultado incerto para {comando_id}: "
+                    f"{type(erro).__name__}: {str(erro)[:200]}"
+                ) from erro
+
+            apertado = time.monotonic()
+            try:
+                driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
+                    **enter_args, 'type': 'keyUp',
+                })
+            except Exception as erro:
+                raise EnterIndeterminado(
+                    f"ENTER keyDown executado, mas keyUp falhou em {comando_id}: "
+                    f"{type(erro).__name__}: {str(erro)[:200]}"
                 ) from erro
 
             final = time.monotonic()
-            marcar_etapa(
-                account_id,
-                f"FALAR: ENTER enviado para {comando_id}.",
-                Fore.GREEN, status="✅ Online",
-            )
+            marcar_etapa(account_id, f"FALAR: ENTER enviado para {comando_id}.",
+                         Fore.GREEN, status="✅ Online")
             log(
                 f"[Conta {account_id}] FALAR: tempos → "
-                f"espera_na_fila={espera:.1f}s; "
-                f"buscar={localizado-inicio_chrome:.1f}s; "
-                f"digitar={digitado-localizado:.1f}s; "
-                f"ENTER={final-digitado:.1f}s; "
-                f"total={final-inicio:.1f}s.",
+                f"preparar={preparado-inicio:.1f}s; "
+                f"ENTER_down={apertado-preparado:.1f}s; "
+                f"ENTER_up={final-apertado:.1f}s; total={final-inicio:.1f}s.",
                 Fore.CYAN,
             )
         finally:
@@ -430,7 +469,7 @@ def enviar_mensagem(driver, account_id, mensagem, comando_id):
                     client_config.timeout = timeout_original
                 except Exception:
                     pass
-            falar_ativo.clear()
+            sinalizar_falar(False)
 
 
 # ---------- Ação: IR AO CAFOFO ----------
@@ -902,6 +941,8 @@ def iniciar_sessao(username, password, index):
             marcar_etapa(index, "Abrindo o Big Client...")
             driver.get(URL_BIGCLIENT)
             log(f"[Conta {index}] ✅ Página do Big Client aberta.", Fore.GREEN)
+            marcar_etapa(index, "Sessão: Big Client carregado.", Fore.GREEN,
+                         status="✅ Online", registrar=False)
 
             with lock:
                 status_contas[index] = "✅ Online"

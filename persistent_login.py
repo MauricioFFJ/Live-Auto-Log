@@ -1190,220 +1190,374 @@ class CarinhosIndeterminado(Exception):
 # A tarefa continua trabalhando no DOM; o Python consulta o progresso em pequenas
 # chamadas separadas. Isso evita um execute_async_script bloqueado por 8 minutos.
 TRATAR_CARINHOS_JS = r"""
-// Executado com driver.execute_script. Inicia uma tarefa em background NA PAGINA
-// e devolve imediatamente o controle ao Python.
+// TRATAR E CARINHOS - Fila de linhas + auto clique, dentro da pagina.
+// Iniciada por WebDriver.execute_script. Todas as etapas sao assicronas
+// NO NAVEGADOR: a chamada Python retorna imediatamente.
 const comandoId = String(arguments[0]);
-const limiteSegundos = Math.max(60, Math.min(1800, Number(arguments[1]) || 300));
+const limiteSegundos = Math.max(90, Math.min(1800, Number(arguments[1]) || 300));
 const CHAVE = '__habblive_tratar_carinhos_v2';
-const antiga = window[CHAVE];
-if (antiga && antiga.id === comandoId) {
-    return { aceite: true, retomada: true, estado: antiga.estado, id: comandoId };
+const anterior = window[CHAVE];
+if (anterior && anterior.id === comandoId) {
+    return { aceite: true, retomada: true, estado: anterior.estado, id: comandoId };
 }
-if (antiga && antiga.estado === 'executando') {
-    return { aceite: false, motivo: 'Outra tarefa de cuidados continua em execucao', id: antiga.id };
+if (anterior && anterior.estado === 'executando') {
+    return { aceite: false, motivo: 'Existe outra rotina de cuidados em andamento', id: anterior.id };
 }
 const job = {
     id: comandoId, estado: 'executando', fase: 'iniciando',
     total: 0, processados: 0, tratados: 0, carinhos: 0,
-    sem_acao: 0, erros: 0, fechado: false,
-    nome_atual: '', iniciado: Date.now(), fim: null,
+    sem_acao: 0, erros: 0, fechado: false, nome_atual: '',
+    iniciado: Date.now(), fim: null,
     limite: Date.now() + limiteSegundos * 1000,
     eventos: [], seq: 0, detalhes: ''
 };
 window[CHAVE] = job;
-const registrar = (mensagem) => {
-    job.seq++;
-    job.eventos.push({ seq: job.seq, texto: String(mensagem) });
-    if (job.eventos.length > 250) job.eventos.shift();
-};
-const texto = el => ((el && el.textContent) || '').trim().replace(/\s+/g, ' ');
-const normalizar = s => String(s || '').trim().toLocaleLowerCase('pt-BR');
+const intervalos = { fila: null, autoTratar: null, autoCarinho: null };
+let filaTr = [], processando = false, atual = null, observadorAtivo = false;
+const chavesEnfileiradas = new Set();
+const texto = el => ((el && el.textContent) || '').replace(/\s+/g, ' ').trim();
+const normalizar = s => String(s || '').toLocaleLowerCase('pt-BR').trim();
 const pausa = ms => new Promise(resolve => setTimeout(resolve, ms));
+const registrar = msg => {
+    job.seq++;
+    job.eventos.push({ seq: job.seq, texto: String(msg) });
+    if (job.eventos.length > 240) job.eventos.shift();
+};
 const visivel = el => {
     if (!el || !el.isConnected) return false;
-    const cs = getComputedStyle(el);
-    return cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0'
-        && el.getClientRects().length > 0;
+    const estilo = getComputedStyle(el);
+    return estilo.display !== 'none' && estilo.visibility !== 'hidden' && el.getClientRects().length > 0;
 };
-const verificarPrazo = () => {
-    if (Date.now() > job.limite) throw new Error('Limite de tempo atingido antes de terminar todos os mascotes.');
-};
-async function aguardar(fn, limiteMs, intervalo = 65) {
-    const termina = Date.now() + limiteMs;
-    while (Date.now() <= termina) {
+function verificarPrazo() {
+    if (Date.now() >= job.limite) throw new Error('Limite da tarefa atingido');
+}
+async function aguardar(fn, limiteMs, intervalo = 85) {
+    const ate = Date.now() + limiteMs;
+    while (Date.now() < ate) {
         verificarPrazo();
-        const achou = fn();
-        if (achou) return achou;
+        const resultado = fn();
+        if (resultado) return resultado;
         await pausa(intervalo);
     }
     return null;
 }
 function selectMascote() {
-    return Array.from(document.querySelectorAll('select.form-select.form-select-sm'))
-        .find(el => visivel(el) && Array.from(el.options || []).some(o => o.value === 'mascote')) || null;
+    return [...document.querySelectorAll('select.form-select.form-select-sm')]
+        .find(el => visivel(el) && [...(el.options || [])].some(opt => opt.value === 'mascote')) || null;
 }
-function raiz() {
-    const select = selectMascote();
-    if (!select) return null;
-    const card = select.closest('.nitro-card') || select.closest('[class*="nitro-card"]');
-    return (card && card.querySelector('tr.rounded.p-1')) ? card : document;
+function painelChooser() {
+    const sel = selectMascote();
+    if (!sel) return null;
+    return sel.closest('.nitro-card') || sel.closest('[class*="nitro-card"]') || document;
 }
-function linhas() {
-    const area = raiz();
-    if (!area) return [];
-    return Array.from(area.querySelectorAll('tr.rounded.p-1')).filter(tr => {
+function linhasAtuais() {
+    const raiz = painelChooser();
+    if (!raiz) return [];
+    return [...raiz.querySelectorAll('tr.rounded.p-1')].filter(tr => {
         if (!visivel(tr)) return false;
-        const tds = tr.querySelectorAll('td');
+        const cols = tr.querySelectorAll('td');
         const nome = tr.querySelector('td:first-child .d-inline.text-black.text-truncate');
-        return tds.length >= 2 && nome && texto(nome) && /mascote|planta/i.test(texto(tds[1]));
+        return cols.length >= 2 && nome && texto(nome) && /mascote|planta/i.test(texto(cols[1]));
     });
 }
-function nomeLinha(tr) {
+function nomeTr(tr) {
     return texto(tr && tr.querySelector('td:first-child .d-inline.text-black.text-truncate'));
 }
-function inventario() {
+function atualizarFilaTr() {
+    if (job.estado !== 'executando') return;
+    const rows = linhasAtuais();
     const repetidos = new Map();
-    return linhas().map((linha, indice) => {
-        const nome = nomeLinha(linha), chave = normalizar(nome);
-        const ocorrencia = repetidos.get(chave) || 0;
-        repetidos.set(chave, ocorrencia + 1);
-        return { nome, indice, ocorrencia, linha };
-    });
-}
-function localizar(item) {
-    const atuais = linhas();
-    if (item.linha && atuais.includes(item.linha)) return item.linha;
-    if (atuais[item.indice] && normalizar(nomeLinha(atuais[item.indice])) === normalizar(item.nome))
-        return atuais[item.indice];
-    return atuais.filter(row => normalizar(nomeLinha(row)) === normalizar(item.nome))[item.ocorrencia] || null;
-}
-function opcao() {
-    const menu = Array.from(document.querySelectorAll('.nitro-context-menu.visible')).find(visivel);
-    // Restricao ao menu visivel evita clicar em opcoes de outros componentes.
-    if (!menu) return null;
-    for (const el of Array.from(menu.querySelectorAll('div.menu-item.list-item')).filter(visivel)) {
-        const label = texto(el);
-        if (/^tratar$/i.test(label)) return { tipo: 'tratar', el };
-        const m = label.match(/^acarici(?:a|ar)\s*\(\s*(\d+)\s*\)$/i);
-        if (m) return { tipo: 'acariciar', numero: Number(m[1]), el };
+    for (let indice = 0; indice < rows.length; indice++) {
+        const el = rows[indice], nome = nomeTr(el), chaveNome = normalizar(nome);
+        const ocorrencia = (repetidos.get(chaveNome) || 0);
+        repetidos.set(chaveNome, ocorrencia + 1);
+        // Combina posicao + nome + ocorrencia para evitar reinscricao se React
+        // recriar os elementos. Nomes iguais em linhas diferentes sao distintos.
+        const chave = indice + '|' + chaveNome + '|' + ocorrencia;
+        if (chavesEnfileiradas.has(chave)) continue;
+        if (chavesEnfileiradas.size >= 250) {
+            registrar('Limite de 250 linhas atingido.');
+            continue;
+        }
+        chavesEnfileiradas.add(chave);
+        el.setAttribute('data-enfileirado', 'true');
+        filaTr.push({ chave, indice, nome, ocorrencia });
+        job.total++;
     }
+}
+function localizarTr(item) {
+    const rows = linhasAtuais();
+    if (rows[item.indice] && normalizar(nomeTr(rows[item.indice])) === normalizar(item.nome))
+        return rows[item.indice];
+    return rows.filter(row => normalizar(nomeTr(row)) === normalizar(item.nome))[item.ocorrencia] || null;
+}
+function procurarAcao() {
+    // Preferir o menu de contexto visivel para nao clicar em outra janela.
+    const menus = [...document.querySelectorAll('.nitro-context-menu.visible')].filter(visivel);
+    let botoes = [];
+    if (menus.length) {
+        botoes = menus.flatMap(menu => [...menu.querySelectorAll('.menu-item.list-item')]).filter(visivel);
+    } else {
+        // Fallback caso o cliente renderize o menu fora desse container.
+        botoes = [...document.querySelectorAll('div.menu-item.list-item')].filter(visivel);
+    }
+    const tratar = botoes.find(el => /^tratar$/i.test(texto(el)));
+    if (tratar) return { tipo: 'tratar', el: tratar };
+    const carinho = botoes.map(el => ({ el, m: texto(el).match(/^acarici(?:a|ar)\s*\(\s*(\d+)\s*\)$/i) }))
+        .find(item => item.m);
+    if (carinho) return { tipo: 'carinho', el: carinho.el, numero: Number(carinho.m[1]) };
     return null;
 }
-async function abrirMenu(item, maxTentativas = 2) {
-    for (let tentativa = 0; tentativa < maxTentativas; tentativa++) {
-        const linha = localizar(item);
-        if (!linha) throw new Error('Linha saiu da lista antes do clique.');
-        const nome = linha.querySelector('td:first-child .d-inline.text-black.text-truncate') || linha;
-        nome.click();
-        const achou = await aguardar(opcao, 500);
-        if (achou) return achou;
-    }
-    return null;
-}
-async function acariciar(item, primeira) {
-    let atual = primeira;
-    let cliques = 0;
-    while (atual && atual.tipo === 'acariciar') {
-        verificarPrazo();
-        if (++cliques > 15) throw new Error('Mais de 15 cliques em um unico mascote; abortando item.');
-        const numeroAntes = atual.numero;
-        if (!Number.isInteger(numeroAntes) || numeroAntes < 1 || numeroAntes > 99)
-            throw new Error('Contador Acaricia invalido.');
-        atual.el.click();
-        // Contabiliza o clique enviado, não confirma ainda o respeito no servidor.
-        job.carinhos++;
-        await pausa(90);
-        let nova = opcao();
-        if (nova && nova.tipo === 'acariciar' && nova.numero >= numeroAntes) {
-            nova = await aguardar(() => {
-                const a = opcao();
-                return (!a || a.tipo !== 'acariciar' || a.numero < numeroAntes) ? { opcao: a } : null;
-            }, 750);
-            nova = nova ? nova.opcao : opcao();
-        }
-        if (!nova) {
-            // O menu costuma fechar depois de clicar. Reabre para ler o NOVO contador.
-            nova = await abrirMenu(item, 1);
-        }
-        if (!nova || nova.tipo !== 'acariciar') return cliques;
-        if (nova.numero >= numeroAntes) {
-            // Nao repetir quando houve clique, mas o contador nao mudou.
-            throw new Error('Acaricia (' + numeroAntes + ') nao diminuiu; sem repetir clique incerto.');
-        }
-        atual = nova;
-    }
-    return cliques;
-}
-function fecharChooser() {
-    const select = selectMascote();
-    const card = select && (select.closest('.nitro-card') || select.closest('[class*="nitro-card"]'));
-    const closes = Array.from(document.querySelectorAll('.nitro-card-header-close')).filter(visivel);
-    const btn = (card && closes.find(el => card.contains(el))) || closes[closes.length - 1];
-    if (!btn) return false;
-    btn.click();
+function clicarLinha(item) {
+    const tr = localizarTr(item);
+    if (!tr) return false;
+    // O clique no TR e intencional: segue o mesmo padrao usado no console.
+    tr.click();
+    tr.setAttribute('data-clicked', 'true');
     return true;
 }
-async function executar() {
+function toggleFilaTr(on) {
+    if (on && !observadorAtivo) {
+        const raiz = painelChooser();
+        if (!raiz) return false;
+        // O observer monitora apenas adicoes/remocoes, NAO atributos,
+        // evitando reexecutar por causa de data-enfileirado/data-clicked.
+        const observer = new MutationObserver(() => atualizarFilaTr());
+        observer.observe(raiz, { childList: true, subtree: true });
+        intervalos.fila = observer;
+        observadorAtivo = true;
+        atualizarFilaTr();
+        return true;
+    }
+    if (!on && intervalos.fila) {
+        intervalos.fila.disconnect();
+        intervalos.fila = null;
+        observadorAtivo = false;
+    }
+    return false;
+}
+function toggleAutoTratar(on) {
+    if (!on) {
+        if (intervalos.autoTratar) clearInterval(intervalos.autoTratar);
+        intervalos.autoTratar = null;
+        return;
+    }
+    if (intervalos.autoTratar) return;
+    intervalos.autoTratar = setInterval(() => {
+        if (!atual || atual.fase !== 'pronto' || atual.finalizado) return;
+        const acao = procurarAcao();
+        if (!acao || acao.tipo !== 'tratar') return;
+        atual.fase = 'acionando'; // Bloqueia outro clique antes de alterar o DOM.
+        try {
+            acao.el.click();
+            job.tratados++;
+            atual.resultado = 'tratado';
+            atual.finalizado = true;
+        } catch (e) {
+            atual.erro = 'Tratar: ' + String(e && e.message || e);
+            atual.finalizado = true;
+        }
+    }, 110);
+}
+function toggleAutoCarinho(on) {
+    if (!on) {
+        if (intervalos.autoCarinho) clearInterval(intervalos.autoCarinho);
+        intervalos.autoCarinho = null;
+        return;
+    }
+    if (intervalos.autoCarinho) return;
+    intervalos.autoCarinho = setInterval(() => {
+        if (!atual || atual.fase !== 'pronto' || atual.finalizado) return;
+        const acao = procurarAcao();
+        if (!acao || acao.tipo !== 'carinho') return;
+        if (!Number.isInteger(acao.numero) || acao.numero < 1 || acao.numero > 20) {
+            atual.erro = 'Contador de Acaricia invalido';
+            atual.finalizado = true;
+            return;
+        }
+        // So realiza novo clique depois de o contador ter diminuido.
+        if (atual.ultimoContador !== null && acao.numero >= atual.ultimoContador) return;
+        if (atual.enviados >= 15) {
+            atual.erro = 'Limite de 15 carinhos atingido no mesmo item';
+            atual.finalizado = true;
+            return;
+        }
+        atual.fase = 'aguardando-contador';
+        atual.ultimoContador = acao.numero;
+        atual.ultimoCliqueEm = Date.now();
+        try {
+            acao.el.click();
+            atual.enviados++;
+            job.carinhos++;
+        } catch (e) {
+            atual.erro = 'Acaricia: ' + String(e && e.message || e);
+            atual.finalizado = true;
+        }
+    }, 110);
+}
+async function executarItem(item) {
+    verificarPrazo();
+    if (!clicarLinha(item)) throw new Error('Linha desapareceu da lista');
+    await pausa(140); // Evita pegar o menu anterior antes de React atualizar.
+    let acao = await aguardar(procurarAcao, 900);
+    if (!acao) {
+        if (!clicarLinha(item)) throw new Error('Linha indisponivel para selecionar');
+        acao = await aguardar(procurarAcao, 500);
+    }
+    if (!acao) return 'sem_acao';
+    const ativo = {
+        fase: 'pronto', finalizado: false, resultado: '', erro: '',
+        ultimoContador: null, ultimoCliqueEm: 0, enviados: 0,
+        reaberturas: 0
+    };
+    atual = ativo;
+    const deadline = Math.min(job.limite, Date.now() + 8500);
     try {
-        job.fase = 'aguardando chooser';
-        const select = await aguardar(selectMascote, 9000);
-        if (!select) throw new Error('Nao foi encontrado filtro mascote do chooser.');
-        job.fase = 'selecionando mascote';
-        const setValue = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-        setValue.call(select, 'mascote');
-        select.dispatchEvent(new Event('input', { bubbles: true }));
-        select.dispatchEvent(new Event('change', { bubbles: true }));
-        registrar('Filtro mascote selecionado.');
-        await pausa(200);
-        if (select.value !== 'mascote') throw new Error('Nao foi possivel selecionar mascote.');
-
-        job.fase = 'obtendo itens';
-        await aguardar(() => linhas().length > 0, 5000);
-        const itens = inventario();
-        job.total = itens.length;
-        registrar('Detectados ' + itens.length + ' itens; nomes repetidos sao linhas distintas.');
-        if (itens.length > 250) throw new Error('Mais de 250 itens: interrompido para seguranca.');
-        for (const item of itens) {
+        while (!ativo.finalizado && Date.now() < deadline) {
             verificarPrazo();
+            if (ativo.fase === 'aguardando-contador' && Date.now() - ativo.ultimoCliqueEm >= 220) {
+                const depois = procurarAcao();
+                if (depois && depois.tipo === 'carinho' && depois.numero < ativo.ultimoContador) {
+                    ativo.reaberturas = 0;
+                    ativo.fase = 'pronto'; // Proximo clique no timer automatico.
+                } else if (!depois || depois.tipo !== 'carinho') {
+                    if (ativo.ultimoContador === 1) {
+                        ativo.resultado = 'carinhos';
+                        ativo.finalizado = true;
+                    } else if (ativo.reaberturas < 2) {
+                        ativo.reaberturas++;
+                        clicarLinha(item); // Reabrir menu para verificar o contador atual.
+                        ativo.fase = 'verificando-reabertura';
+                        ativo.reabriuEm = Date.now();
+                    } else {
+                        ativo.erro = 'Menu ausente apos carinho; nao repetir clique incerto';
+                        ativo.finalizado = true;
+                    }
+                } else if (Date.now() - ativo.ultimoCliqueEm >= 950) {
+                    if (ativo.reaberturas < 1) {
+                        ativo.reaberturas++;
+                        clicarLinha(item);
+                        ativo.fase = 'verificando-reabertura';
+                        ativo.reabriuEm = Date.now();
+                    } else {
+                        ativo.erro = 'Contador nao diminuiu; sem repetir clique';
+                        ativo.finalizado = true;
+                    }
+                }
+            } else if (ativo.fase === 'verificando-reabertura' && Date.now() - ativo.reabriuEm >= 220) {
+                const depois = procurarAcao();
+                if (depois && depois.tipo === 'carinho' && depois.numero < ativo.ultimoContador) {
+                    ativo.reaberturas = 0;
+                    ativo.fase = 'pronto';
+                } else if (!depois || depois.tipo !== 'carinho') {
+                    if (Date.now() - ativo.reabriuEm >= 650) {
+                        // A opcao pode desaparecer quando os carinhos se esgotam.
+                        ativo.resultado = 'carinhos';
+                        ativo.finalizado = true;
+                    }
+                } else if (Date.now() - ativo.reabriuEm >= 750) {
+                    ativo.erro = 'Contador inalterado mesmo apos reabrir menu';
+                    ativo.finalizado = true;
+                }
+            }
+            await pausa(75);
+        }
+        if (!ativo.finalizado) throw new Error('Tempo por item excedido');
+        if (ativo.erro) throw new Error(ativo.erro);
+        return ativo.resultado || (ativo.enviados ? 'carinhos' : 'sem_acao');
+    } finally {
+        if (atual === ativo) atual = null;
+    }
+}
+async function processarFila() {
+    if (processando || job.estado !== 'executando') return;
+    processando = true;
+    try {
+        while (filaTr.length) {
+            verificarPrazo();
+            const item = filaTr.shift();
             job.nome_atual = item.nome + ' #' + (item.ocorrencia + 1);
             job.fase = 'processando ' + job.nome_atual;
             try {
-                const op = await abrirMenu(item, 2);
-                if (!op) {
-                    job.sem_acao++;
-                    registrar(job.nome_atual + ': sem Tratar/Acaricia');
-                } else if (op.tipo === 'tratar') {
-                    op.el.click();
-                    job.tratados++;
-                    registrar(job.nome_atual + ': clique Tratar enviado');
-                    await pausa(75);
-                } else {
-                    const totalCliques = await acariciar(item, op);
-                    registrar(job.nome_atual + ': ' + totalCliques + ' clique(s) Acaricia enviados');
-                }
+                const resultado = await executarItem(item);
+                if (resultado === 'sem_acao') job.sem_acao++;
+                registrar(job.nome_atual + ': ' + resultado);
             } catch (e) {
                 job.erros++;
-                registrar(job.nome_atual + ': erro/resultado incerto: ' + String(e?.message || e));
+                registrar(job.nome_atual + ': resultado incerto/erro: ' + String(e && e.message || e));
             }
             job.processados++;
-            await pausa(60);
+            // O intervalo de 500ms entre linhas segue a ideia da fila original.
+            await pausa(500);
+            atualizarFilaTr();
+        }
+    } finally {
+        processando = false;
+    }
+}
+function fecharChooser() {
+    const sel = selectMascote();
+    const card = sel && (sel.closest('.nitro-card') || sel.closest('[class*="nitro-card"]'));
+    const closes = [...document.querySelectorAll('.nitro-card-header-close')].filter(visivel);
+    const alvo = closes.find(el => card && card.contains(el)) || closes[closes.length - 1];
+    if (!alvo) return false;
+    alvo.click();
+    return true;
+}
+function pararTudo() {
+    toggleFilaTr(false);
+    toggleAutoTratar(false);
+    toggleAutoCarinho(false);
+    atual = null;
+}
+async function iniciar() {
+    try {
+        job.fase = 'aguardando chooser';
+        const sel = await aguardar(selectMascote, 9000);
+        if (!sel) throw new Error('Filtro mascote nao encontrado apos :chooser');
+        job.fase = 'selecionando mascote';
+        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+        setter.call(sel, 'mascote');
+        sel.dispatchEvent(new Event('input', { bubbles: true }));
+        sel.dispatchEvent(new Event('change', { bubbles: true }));
+        registrar('Filtro mascote selecionado.');
+        await pausa(180);
+        if (sel.value !== 'mascote') throw new Error('Nao foi possivel selecionar filtro mascote');
+        job.fase = 'capturando linhas';
+        await aguardar(() => linhasAtuais().length > 0, 4000);
+        if (!toggleFilaTr(true)) throw new Error('Nao foi possivel observar lista de mascotes');
+        registrar('Fila iniciada com ' + job.total + ' linha(s); nomes repetidos sao tratados separadamente.');
+        toggleAutoTratar(true);
+        toggleAutoCarinho(true);
+        // Atualiza a fila sem depender exclusivamente do MutationObserver.
+        while (job.estado === 'executando') {
+            verificarPrazo();
+            atualizarFilaTr();
+            if (filaTr.length) {
+                job.fase = 'percorrendo fila';
+                await processarFila();
+            }
+            // Janela curta para mudancas da lista apos terminar os itens.
+            const antes = job.total;
+            await pausa(400);
+            atualizarFilaTr();
+            if (!filaTr.length && job.total === antes) break;
         }
         job.fase = 'fechando chooser';
         job.fechado = fecharChooser();
-        job.estado = job.erros ? 'parcial' : 'concluido';
-        registrar('Finalizado: ' + job.processados + '/' + job.total + ' itens, erros=' + job.erros);
+        job.estado = job.erros || !job.fechado ? 'parcial' : 'concluido';
+        registrar('Finalizado: ' + job.processados + '/' + job.total + '; erros=' + job.erros);
     } catch (e) {
-        job.detalhes = String(e?.message || e);
+        job.detalhes = String(e && e.message || e);
         registrar('Interrompido: ' + job.detalhes);
         job.estado = job.processados ? 'parcial' : 'erro';
-        job.fase = 'interrompido';
         try { job.fechado = fecharChooser(); } catch (_) {}
     } finally {
+        pararTudo();
         job.fim = Date.now();
     }
 }
-// Inicia o processamento local e retorna imediatamente ao Selenium.
-void executar();
+void iniciar();
 return { aceite: true, retomada: false, estado: job.estado, id: comandoId };
 """
 

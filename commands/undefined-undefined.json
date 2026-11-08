@@ -1,0 +1,13 @@
+{
+  "id": "undefined-undefined",
+  "action": "say",
+  "message": "Bom dia :)",
+  "targets": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "created_at": "2026-11-08T13:04:29.738Z"
+}

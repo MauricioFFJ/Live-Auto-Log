@@ -37,7 +37,7 @@ RESPEITAR_MAX_ATTEMPTS = 1  # Nunca repetir automaticamente uma acao que consome
 RESPEITAR_SCRIPT_TIMEOUT = max(85, int(os.getenv("RESPEITAR_SCRIPT_TIMEOUT", "105")))
 VISITAR_QUARTO_SCRIPT_TIMEOUT = max(30, int(os.getenv("VISITAR_QUARTO_SCRIPT_TIMEOUT", "60")))
 TRATAR_CARINHOS_MAX_SECONDS = max(60, int(os.getenv("TRATAR_CARINHOS_MAX_SECONDS", "180")))
-TRATAR_CARINHOS_POLL_SECONDS = max(2, int(os.getenv("TRATAR_CARINHOS_POLL_SECONDS", "3")))
+TRATAR_CARINHOS_POLL_SECONDS = max(3, int(os.getenv("TRATAR_CARINHOS_POLL_SECONDS", "6")))
 FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "1")))  # Evita várias tentativas longas em Chrome travado.
 CHAT_MAX_SIMULTANEOS = max(1, int(os.getenv("CHAT_MAX_SIMULTANEOS", "5")))  # Contas independentes: sem fila global por padrão.
 CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "25")))
@@ -1190,306 +1190,252 @@ class CarinhosIndeterminado(Exception):
 # A tarefa continua trabalhando no DOM; o Python consulta o progresso em pequenas
 # chamadas separadas. Isso evita um execute_async_script bloqueado por 8 minutos.
 TRATAR_CARINHOS_JS = r"""
-// Fila rapida de linhas com autocliques de Tratar e Acaricia (X).
-// Executa dentro da aba; o Selenium so inicia e acompanha o estado.
-const comandoId = String(arguments[0]);
+// TRATAR E CARINHOS - fila simples de <tr> + autocliques independentes.
+// O andamento acontece inteiramente na pagina; nenhum Selenium por mascote.
+const id = String(arguments[0]);
 const limiteSegundos = Math.max(60, Math.min(1800, Number(arguments[1]) || 180));
-const CHAVE = '__habblive_tratar_carinhos_v2';
+const CHAVE = '__habblive_tratar_carinhos_v3';
 const anterior = window[CHAVE];
-if (anterior && anterior.id === comandoId) {
-    return { aceite: true, retomada: true, estado: anterior.estado, id: comandoId };
+if (anterior && anterior.id === id) {
+  return {aceite:true, retomada:true, estado:anterior.estado, id};
 }
 if (anterior && anterior.estado === 'executando') {
-    return { aceite: false, motivo: 'Ja existe um tratamento em execucao', id: anterior.id };
+  return {aceite:false, motivo:'Uma lista ainda esta sendo executada', id:anterior.id};
 }
+
 const job = {
-    id: comandoId, estado: 'executando', fase: 'iniciando',
-    total: 0, processados: 0, tratados: 0, carinhos: 0,
-    sem_acao: 0, erros: 0, fechado: false, nome_atual: '',
-    iniciado: Date.now(), fim: null,
-    limite: Date.now() + limiteSegundos * 1000,
-    eventos: [], seq: 0, detalhes: ''
+  id, estado:'executando', fase:'aguardando filtro mascote',
+  total:0, processados:0, tratados:0, carinhos:0,
+  sem_acao:0, erros:0, fechado:false, nome_atual:'',
+  iniciado:Date.now(), fim:null, detalhes:'',
+  seq:0, eventos:[], ultimo_avanco:Date.now(),
 };
 window[CHAVE] = job;
 
-const registros = new Set();
 const filaTr = [];
-let itemAtual = null;
-let observador = null;
-let relogioFila = null;
-let autoTratar = null;
-let autoCarinho = null;
-let varreduraAgendada = false;
-const texto = el => (el && el.textContent || '').replace(/\s+/g, ' ').trim();
-const normalizar = s => String(s || '').toLocaleLowerCase('pt-BR').trim();
+const conhecidos = new Set();
+const texto = el => String(el?.textContent || '').replace(/\s+/g,' ').trim();
 const pausa = ms => new Promise(resolve => setTimeout(resolve, ms));
+const LABEL_ACARICIA = /^acarici(?:a|ar)\s*\(\s*(\d+)\s*\)$/i;
+let raiz = null, select = null, observador = null;
+let autoTratar = null, autoCarinho = null;
+let temporizadorProximo = null, encerrado = false;
+let itemAtual = null, ultimaMudanca = Date.now();
+
 function registrar(msg) {
-    job.seq++;
-    job.eventos.push({ seq: job.seq, texto: String(msg) });
-    if (job.eventos.length > 240) job.eventos.shift();
+  job.seq += 1;
+  job.eventos.push({seq:job.seq, texto:String(msg)});
+  if (job.eventos.length > 160) job.eventos.shift();
 }
-function visivel(el) {
-    if (!el || !el.isConnected) return false;
-    const estilo = getComputedStyle(el);
-    return estilo.display !== 'none' && estilo.visibility !== 'hidden' && el.getClientRects().length > 0;
+function filtroMascote() {
+  return [...document.querySelectorAll('select.form-select.form-select-sm')]
+    .find(s => [...s.options].some(o => o.value === 'mascote')) || null;
 }
-function prazo() {
-    if (Date.now() > job.limite) throw Error('Limite de seguranca da tarefa atingido');
+function obterRaiz() {
+  if (raiz && raiz.isConnected) return raiz;
+  select = filtroMascote();
+  raiz = select?.closest('.nitro-card') || select?.closest('[class*="nitro-card"]') || document;
+  return raiz;
 }
-function selecionarMascote() {
-    return [...document.querySelectorAll('select.form-select.form-select-sm')]
-        .find(sel => visivel(sel) && [...sel.options].some(opt => opt.value === 'mascote')) || null;
+function linhaNome(tr) {
+  return texto(tr.querySelector('td:first-child .d-inline.text-black.text-truncate')) ||
+         texto(tr.querySelector('td:first-child'));
 }
-function raizChooser() {
-    const sel = selecionarMascote();
-    if (!sel) return null;
-    return sel.closest('.nitro-card') || sel.closest('[class*="nitro-card"]') || document;
-}
-function linhas() {
-    const raiz = raizChooser();
-    if (!raiz) return [];
-    return [...raiz.querySelectorAll('tr.rounded.p-1')].filter(tr => {
-        const colunas = tr.querySelectorAll('td');
-        return colunas.length >= 2 && visivel(tr) &&
-            texto(tr.querySelector('td:first-child .d-inline.text-black.text-truncate')) &&
-            /mascote|planta/i.test(texto(colunas[1]));
-    });
-}
-function nomeLinha(tr) {
-    return texto(tr && tr.querySelector('td:first-child .d-inline.text-black.text-truncate'));
+function linhasAtuais() {
+  return [...obterRaiz().querySelectorAll('tr.rounded.p-1')]
+     .filter(tr => tr.querySelector('td') && linhaNome(tr));
 }
 function atualizarFilaTr() {
-    if (job.estado !== 'executando') return;
-    const atuais = linhas();
-    const repetidos = new Map();
-    atuais.forEach((tr, indice) => {
-        const nome = nomeLinha(tr);
-        const chaveNome = normalizar(nome);
-        const ocorrencia = repetidos.get(chaveNome) || 0;
-        repetidos.set(chaveNome, ocorrencia + 1);
-        // Indice + ocorrencia preserva os itens com o mesmo nome.
-        const chave = `${indice}|${chaveNome}|${ocorrencia}`;
-        if (registros.has(chave)) return;
-        if (registros.size >= 500) return;
-        registros.add(chave);
-        tr.dataset.enfileirado = 'true';
-        filaTr.push({ chave, indice, nome, ocorrencia });
-        job.total++;
-    });
+  if (encerrado || job.estado !== 'executando') return;
+  const todos = linhasAtuais();
+  const repetidos = new Map();
+  todos.forEach((tr, indice) => {
+    const nome = linhaNome(tr);
+    const numero = repetidos.get(nome) || 0;
+    repetidos.set(nome, numero + 1);
+    // Indice e ocorrencia: mesmo nome em linhas diferentes NAO e descartado.
+    const chave = indice + '|' + nome + '|' + numero;
+    if (conhecidos.has(chave)) return;
+    if (conhecidos.size >= 500) return;
+    conhecidos.add(chave);
+    tr.dataset.enfileirado = 'true';
+    filaTr.push({chave,nome,indice,numero,tr});
+    job.total++;
+    ultimaMudanca = Date.now();
+  });
 }
-function agendarVarredura() {
-    if (varreduraAgendada) return;
-    varreduraAgendada = true;
-    setTimeout(() => { varreduraAgendada = false; atualizarFilaTr(); }, 90);
+function localizar(item) {
+  if (item.tr.isConnected) return item.tr;
+  const atual = linhasAtuais();
+  if (atual[item.indice] && linhaNome(atual[item.indice]) === item.nome) return atual[item.indice];
+  return atual.filter(tr => linhaNome(tr) === item.nome)[item.numero] || null;
 }
-function localizarTr(item) {
-    const atuais = linhas();
-    if (atuais[item.indice] && normalizar(nomeLinha(atuais[item.indice])) === normalizar(item.nome))
-        return atuais[item.indice];
-    return atuais.filter(el => normalizar(nomeLinha(el)) === normalizar(item.nome))[item.ocorrencia] || null;
+function botoesVisiveis() {
+  const menus = [...document.querySelectorAll('.nitro-context-menu.visible')];
+  let botoes = menus.flatMap(menu => [...menu.querySelectorAll('.menu-item.list-item')]);
+  if (!botoes.length) botoes = [...document.querySelectorAll('.menu-item.list-item')];
+  return botoes.filter(el => el.isConnected && el.getClientRects().length);
 }
-function clicarLinha(item) {
-    const tr = localizarTr(item);
-    if (!tr) return false;
-    tr.click();
-    tr.dataset.clicked = 'true';
-    return true;
+function acaoDisponivel() {
+  const lista = botoesVisiveis();
+  for (const el of lista) if (/^tratar$/i.test(texto(el))) return {tipo:'tratar',el};
+  for (const el of lista) {
+    const match = texto(el).match(LABEL_ACARICIA);
+    if (match) return {tipo:'carinho',el,qtd:Number(match[1])};
+  }
+  return null;
 }
-function acaoVisivel() {
-    // Menus do chooser normalmente estao no portal do documento.
-    const menus = [...document.querySelectorAll('.nitro-context-menu.visible')].filter(visivel);
-    const botoes = (menus.length
-        ? menus.flatMap(m => [...m.querySelectorAll('.menu-item.list-item')])
-        : [...document.querySelectorAll('.menu-item.list-item')]).filter(visivel);
-    const tratar = botoes.find(el => /^tratar$/i.test(texto(el)));
-    if (tratar) return { tipo: 'tratar', el: tratar };
-    for (const el of botoes) {
-        const m = texto(el).match(/^acarici(?:a|ar)\s*\(\s*(\d+)\s*\)$/i);
-        if (m) return { tipo: 'carinho', el, numero: Number(m[1]) };
+function autoClickTratar() {
+  if (!itemAtual || encerrado || itemAtual.tratou || itemAtual.carinhos > 0) return;
+  const acao = acaoDisponivel();
+  if (!acao || acao.tipo !== 'tratar') return;
+  try {
+    itemAtual.tratou = true; // clique unico em Tratar para esta linha
+    acao.el.click();
+    job.tratados += 1;
+  } catch (e) { job.erros += 1; registrar('Erro Tratar: '+String(e.message||e)); }
+}
+function autoClickCarinho() {
+  if (!itemAtual || encerrado || itemAtual.tratou) return;
+  const acao = acaoDisponivel();
+  if (!acao || acao.tipo !== 'carinho') {
+    // Se o menu fechar apos cada carinho, reabre a MESMA linha antes de avancar.
+    if (!acao && itemAtual.meta !== null && itemAtual.carinhos < itemAtual.meta &&
+        Date.now() - itemAtual.ultimoCarinho >= 95 &&
+        itemAtual.reaberturas < itemAtual.meta) {
+      const tr = localizar(itemAtual.item);
+      if (tr) { tr.click(); itemAtual.reaberturas++; itemAtual.ultimoCarinho = Date.now(); }
     }
-    return null;
+    return;
+  }
+  if (!Number.isInteger(acao.qtd) || acao.qtd < 1 || acao.qtd > 20) return;
+  if (itemAtual.meta === null) itemAtual.meta = acao.qtd;
+  if (itemAtual.carinhos >= itemAtual.meta) return;
+  if (Date.now() - itemAtual.ultimoCarinho < 65) return;
+  try {
+    acao.el.click();
+    itemAtual.carinhos += 1;
+    itemAtual.ultimoCarinho = Date.now();
+    job.carinhos += 1;
+  } catch (e) { job.erros += 1; registrar('Erro Acaricia: '+String(e.message||e)); }
 }
-function tickAutoTratar() {
-    const atual = itemAtual;
-    if (!atual || atual.concluido || Date.now() - atual.selecionadoEm < 80) return;
-    if (atual.tipo === 'carinho') return;
-    const acao = acaoVisivel();
-    if (!acao || acao.tipo !== 'tratar') return;
-    try {
-        atual.tipo = 'tratar';
-        acao.el.click();
-        atual.tentou = true;
-        atual.concluido = true;
-        job.tratados++;
-    } catch (e) {
-        atual.erro = 'Falha ao clicar Tratar: ' + String(e && e.message || e);
-        atual.concluido = true;
-    }
-}
-function tickAutoCarinho() {
-    const atual = itemAtual;
-    if (!atual || atual.concluido || Date.now() - atual.selecionadoEm < 80) return;
-    if (atual.tipo === 'tratar') return;
-    const acao = acaoVisivel();
-    if (!acao || acao.tipo !== 'carinho') return;
-    const numero = acao.numero;
-    if (!Number.isInteger(numero) || numero < 1 || numero > 20) {
-        atual.erro = 'Quantidade de carinhos invalida';
-        atual.concluido = true;
-        return;
-    }
-    if (atual.meta === null) atual.meta = numero;
-    if (atual.cliques >= atual.meta) {
-        atual.concluido = true;
-        return;
-    }
-    if (Date.now() - atual.ultimoClique < 85) return;
-    try {
-        atual.tipo = 'carinho';
-        acao.el.click();
-        atual.cliques++;
-        job.carinhos++;
-        atual.ultimoClique = Date.now();
-        atual.tentou = true;
-        if (atual.cliques >= atual.meta) atual.concluido = true;
-    } catch (e) {
-        atual.erro = 'Falha ao clicar Acaricia: ' + String(e && e.message || e);
-        atual.concluido = true;
-    }
-}
-async function processarLinha(item) {
-    prazo();
-    const atual = {
-        tipo: '', meta: null, cliques: 0, ultimoClique: 0,
-        selecionadoEm: Date.now(), tentou: false, concluido: false,
-        erro: '', reaberturas: 0
-    };
-    itemAtual = atual;
-    try {
-        if (!clicarLinha(item)) throw Error('A linha deixou de existir');
-        atual.selecionadoEm = Date.now();
-        const INICIO = Date.now();
-        // Nao espera 8,5 segundos por mascote: autoclicks verificam a cada 35 ms.
-        while (!atual.concluido && Date.now() - INICIO < 1500) {
-            prazo();
-            const decorrido = Date.now() - INICIO;
-            if (!atual.tentou && decorrido >= 470) break;
-            // Alguns menus fecham apos cada carinho: reabra rapidamente a mesma linha.
-            if (atual.tipo === 'carinho' && atual.meta !== null &&
-                    atual.cliques < atual.meta && Date.now() - atual.ultimoClique >= 150 &&
-                    atual.reaberturas < atual.meta && !acaoVisivel()) {
-                clicarLinha(item);
-                atual.reaberturas++;
-                atual.selecionadoEm = Date.now();
-            }
-            await pausa(35);
-        }
-        if (atual.erro) throw Error(atual.erro);
-        if (atual.tipo === 'tratar') return 'tratado';
-        if (atual.tipo === 'carinho') {
-            // Cliques foram emitidos; o servidor pode confirmar menos do que o total.
-            if (atual.cliques < atual.meta) throw Error(`Acaricia incompleto: ${atual.cliques}/${atual.meta} cliques emitidos`);
-            return `acariciado (${atual.cliques}/${atual.meta} cliques emitidos)`;
-        }
-        return 'sem_acao';
-    } finally {
-        if (itemAtual === atual) itemAtual = null;
-    }
-}
-async function esperarMascote(maxMs = 9000) {
-    const fim = Date.now() + maxMs;
-    while (Date.now() < fim) {
-        prazo();
-        const sel = selecionarMascote();
-        if (sel) return sel;
-        await pausa(100);
-    }
-    return null;
+function encerrarItemAtual() {
+  if (!itemAtual) return;
+  if (itemAtual.meta !== null && itemAtual.carinhos < itemAtual.meta) {
+    job.erros++;
+    registrar(job.nome_atual + ': Acaricia incompleto ('+itemAtual.carinhos+'/'+itemAtual.meta+' cliques emitidos)');
+  }
+  if (!itemAtual.tratou && !itemAtual.carinhos) job.sem_acao++;
+  itemAtual = null;
 }
 function fecharChooser() {
-    const raiz = raizChooser();
-    const botoes = [...document.querySelectorAll('.nitro-card-header-close')].filter(visivel);
-    const alvo = botoes.find(el => raiz && raiz.contains(el)) || botoes[botoes.length - 1];
-    if (!alvo) return false;
-    alvo.click();
-    return true;
+  const quadro = obterRaiz();
+  const botoes = [...document.querySelectorAll('.nitro-card-header-close')]
+    .filter(el => el.isConnected && el.getClientRects().length);
+  const escolhido = botoes.find(el => quadro && quadro.contains(el)) || botoes.at(-1);
+  if (!escolhido) return false;
+  escolhido.click();
+  return true;
 }
-function encerrarIntervalos() {
-    if (observador) observador.disconnect();
-    if (relogioFila) clearInterval(relogioFila);
-    if (autoTratar) clearInterval(autoTratar);
-    if (autoCarinho) clearInterval(autoCarinho);
-    itemAtual = null;
+function parar() {
+  encerrado = true;
+  if (observador) observador.disconnect();
+  if (autoTratar) clearInterval(autoTratar);
+  if (autoCarinho) clearInterval(autoCarinho);
+  if (temporizadorProximo) clearTimeout(temporizadorProximo);
 }
-async function iniciar() {
-    try {
-        job.fase = 'aguardando chooser';
-        const sel = await esperarMascote();
-        if (!sel) throw Error('Filtro Mascote nao encontrado no chooser');
-        job.fase = 'selecionando filtro mascote';
-        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
-        setter.call(sel, 'mascote');
-        sel.dispatchEvent(new Event('input', { bubbles: true }));
-        sel.dispatchEvent(new Event('change', { bubbles: true }));
-        if (sel.value !== 'mascote') throw Error('O filtro Mascote nao foi selecionado');
-        registrar('Filtro mascote selecionado.');
-        await pausa(220);
-        job.fase = 'montando fila';
-        atualizarFilaTr();
-        observador = new MutationObserver(agendarVarredura);
-        observador.observe(raizChooser() || document.body, { childList: true, subtree: true });
-        relogioFila = setInterval(atualizarFilaTr, 600);
-        autoTratar = setInterval(tickAutoTratar, 35);
-        autoCarinho = setInterval(tickAutoCarinho, 35);
-        registrar(`Fila pronta: ${job.total} item(ns), incluindo nomes repetidos.`);
-        // Sempre percorre todas as linhas. O tempo por item e curto e independente.
-        let filaVaziaEm = null;
-        while (job.estado === 'executando') {
-            prazo();
-            atualizarFilaTr();
-            if (!filaTr.length) {
-                if (filaVaziaEm === null) filaVaziaEm = Date.now();
-                if (Date.now() - filaVaziaEm >= 450) break;
-                await pausa(75);
-                continue;
-            }
-            filaVaziaEm = null;
-            const item = filaTr.shift();
-            job.nome_atual = `${item.nome} #${item.ocorrencia + 1}`;
-            job.fase = 'processando ' + job.nome_atual;
-            try {
-                const resultado = await processarLinha(item);
-                if (resultado === 'sem_acao') job.sem_acao++;
-                registrar(job.nome_atual + ': ' + resultado);
-            } catch (e) {
-                job.erros++;
-                registrar(job.nome_atual + ': erro=' + String(e && e.message || e));
-            }
-            job.processados++;
-            await pausa(65);
-        }
-        job.fase = 'fechando chooser';
-        job.fechado = fecharChooser();
-        job.estado = job.erros || !job.fechado || job.processados < job.total ? 'parcial' : 'concluido';
-        registrar(`Fila percorrida: ${job.processados}/${job.total}; tratados=${job.tratados}; cliques Acaricia=${job.carinhos}; sem_acao=${job.sem_acao}; erros=${job.erros}.`);
-    } catch (e) {
-        job.detalhes = String(e && e.message || e);
-        registrar('Interrompido: ' + job.detalhes);
-        job.estado = job.processados ? 'parcial' : 'erro';
-        try { job.fechado = fecharChooser(); } catch (_) {}
-    } finally {
-        encerrarIntervalos();
-        job.fim = Date.now();
+function finalizar(estado, detalhe='') {
+  if (encerrado) return;
+  encerrarItemAtual();
+  parar();
+  job.detalhes = detalhe;
+  job.fase = 'fechando chooser';
+  try { job.fechado = fecharChooser(); }
+  catch (e) { registrar('Erro ao fechar chooser: '+String(e.message||e)); }
+  job.estado = estado === 'concluido' && job.fechado && job.processados === job.total && !job.erros
+    ? 'concluido' : (job.processados ? 'parcial' : 'erro');
+  job.fim = Date.now();
+  registrar('Fim: '+job.processados+'/'+job.total+' linhas selecionadas; Tratar='+job.tratados+
+    '; cliques Acaricia='+job.carinhos+'; sem clique='+job.sem_acao+
+    '; erros='+job.erros+'; fechado='+job.fechado);
+}
+function proximo() {
+  if (encerrado) return;
+  if (Date.now() - job.iniciado > limiteSegundos*1000) {
+    finalizar('parcial', 'Prazo atingido; ultima linha '+job.nome_atual);
+    return;
+  }
+  try {
+    atualizarFilaTr();
+    if (filaTr.length) {
+      encerrarItemAtual();
+      const item = filaTr.shift();
+      const tr = localizar(item);
+      job.nome_atual = item.nome + ' #' + (item.numero + 1);
+      job.fase = 'selecionando '+job.nome_atual;
+      itemAtual = {item, tratou:false, carinhos:0, meta:null, ultimoCarinho:0, reaberturas:0};
+      if (!tr) {
+        job.erros++;
+        registrar(job.nome_atual+': linha desapareceu');
+      } else {
+        tr.click();
+        tr.dataset.clicked = 'true';
+      }
+      job.processados++;
+      job.ultimo_avanco = Date.now();
+      if (job.processados === 1 || job.processados % 5 === 0)
+        registrar('Progresso '+job.processados+'/'+job.total+'; Tratar='+job.tratados+'; Acaricia='+job.carinhos);
+      // Enquanto a fila avanca, autocliques atuam independentemente.
+      temporizadorProximo = setTimeout(proximo, 650);
+      return;
     }
+    encerrarItemAtual();
+    // Permite a montagem final da lista apos um re-render do chooser.
+    if (Date.now() - ultimaMudanca < 850) {
+      temporizadorProximo = setTimeout(proximo, 150);
+      return;
+    }
+    finalizar('concluido');
+  } catch (e) {
+    job.erros++;
+    registrar('Erro na fila: '+String(e.message||e));
+    temporizadorProximo = setTimeout(proximo, 500);
+  }
 }
-void iniciar();
-return { aceite: true, retomada: false, estado: job.estado, id: comandoId };
+
+(async () => {
+  try {
+    for (let i=0; i<50 && !filtroMascote(); i++) await pausa(100);
+    select = filtroMascote();
+    if (!select) throw Error('Filtro Mascote nao apareceu');
+    job.fase = 'selecionando mascote';
+    const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set;
+    setter.call(select,'mascote');
+    select.dispatchEvent(new Event('input',{bubbles:true}));
+    select.dispatchEvent(new Event('change',{bubbles:true}));
+    registrar('Filtro mascote selecionado');
+    // O React precisa receber o change antes de calcular as linhas.
+    await pausa(250);
+    obterRaiz();
+    atualizarFilaTr();
+    registrar('Fila inicial: '+job.total+' linhas, incluindo nomes repetidos');
+    observador = new MutationObserver(() => atualizarFilaTr());
+    observador.observe(raiz || document.body, {childList:true,subtree:true});
+    autoTratar = setInterval(autoClickTratar, 40);
+    autoCarinho = setInterval(autoClickCarinho, 40);
+    proximo();
+  } catch (e) {
+    registrar('Erro ao iniciar: '+String(e.message||e));
+    finalizar('erro',String(e.message||e));
+  }
+})();
+return {aceite:true, retomada:false, id, estado:job.estado};
 """
 
 TRATAR_CARINHOS_STATUS_JS = r"""
 const id = String(arguments[0]);
 const depois = Number(arguments[1]) || 0;
-const job = window.__habblive_tratar_carinhos_v2;
+const job = window.__habblive_tratar_carinhos_v3;
 if (!job || job.id !== id) return { existe: false, id };
 return {
     existe: true, id: job.id, estado: job.estado, fase: job.fase,
@@ -1905,7 +1851,7 @@ def processar_comando_da_fila(driver, account_id):
         elif acao == "treat_pets":
             log(
                 f"[Conta {account_id}] TRATAR E CARINHOS {comando_id}: "
-                "lista percorrida nesta conta (conferir resumo de erros).",
+                "linhas selecionadas nesta conta (cliques nao garantem aceite pelo servidor).",
                 Fore.GREEN,
             )
 

@@ -35,6 +35,7 @@ COMMAND_MAX_ATTEMPTS = 5  # Legado: mantém compatibilidade com futuros comandos
 CAFOFO_MAX_ATTEMPTS = max(1, int(os.getenv("CAFOFO_MAX_ATTEMPTS", "2")))
 RESPEITAR_MAX_ATTEMPTS = 1  # Nunca repetir automaticamente uma acao que consome respeitos.
 RESPEITAR_SCRIPT_TIMEOUT = max(85, int(os.getenv("RESPEITAR_SCRIPT_TIMEOUT", "105")))
+VISITAR_QUARTO_SCRIPT_TIMEOUT = max(30, int(os.getenv("VISITAR_QUARTO_SCRIPT_TIMEOUT", "60")))
 FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "1")))  # Evita várias tentativas longas em Chrome travado.
 CHAT_MAX_SIMULTANEOS = max(1, int(os.getenv("CHAT_MAX_SIMULTANEOS", "5")))  # Contas independentes: sem fila global por padrão.
 CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "25")))
@@ -116,7 +117,7 @@ def painel_status(account_ids):
                 # Um navegador ocioso/Online não está travado só porque passou
                 # algum tempo sem uma operação Selenium. Alertar apenas quando
                 # houver uma operação efetivamente em andamento.
-                operacao_ativa = (estado in ("💬 FALAR", "🏠 CAFOFO", "🤝 RESPEITAR") or etapa.startswith(
+                operacao_ativa = (estado in ("💬 FALAR", "🏠 CAFOFO", "🤝 RESPEITAR", "🚪 VISITAR QUARTO") or etapa.startswith(
                     ("Sessão: consultando", "Criando ChromeDriver", "Abrindo", "Preenchendo")))
                 if ultima is not None and operacao_ativa:
                     sem_progresso = int(agora - ultima)
@@ -852,6 +853,331 @@ function fecharChooser() {
 """
 
 
+
+# ---------- Ação: VISITAR QUARTO ----------
+class VisitaIndeterminada(Exception):
+    """O clique pode ter sido executado, mas a resposta do navegador foi perdida."""
+
+
+def visitar_quarto(driver, account_id, dados, comando_id):
+    """Navega pela busca de dono e escolhe a sala mais próxima do nome pedido.
+
+    O DOM é manipulado em UMA chamada assíncrona ao navegador para evitar
+    múltiplos round-trips lentos do WebDriver. Não há repetição automática,
+    pois um clique de entrada pode ter ocorrido antes de um timeout.
+    """
+    if not isinstance(dados, dict):
+        raise ValueError("VISITAR QUARTO recebeu um payload inválido.")
+    dono = str(dados.get("owner", "")).strip()
+    quarto = str(dados.get("room", "")).strip()
+    if (not dono or not quarto or len(dono) > 60 or len(quarto) > 100
+            or any(c in dono + quarto for c in "\r\n")):
+        raise ValueError("Nome do dono ou quarto inválido no comando.")
+
+    marcar_etapa(
+        account_id,
+        f"VISITAR QUARTO: buscando quartos de {dono!r} com nome parecido a {quarto!r}...",
+        status="🚪 VISITAR QUARTO",
+    )
+    inicio = time.monotonic()
+    try:
+        driver.set_script_timeout(VISITAR_QUARTO_SCRIPT_TIMEOUT)
+        resposta = driver.execute_async_script(
+            VISITAR_QUARTO_JS,
+            dono,
+            quarto,
+            (VISITAR_QUARTO_SCRIPT_TIMEOUT - 5) * 1000,
+        )
+    except Exception as erro:
+        # A navegação pode ter acontecido, inclusive interrompendo o próprio JS.
+        raise VisitaIndeterminada(
+            f"VISITAR QUARTO {comando_id}: navegador não confirmou o resultado "
+            f"({type(erro).__name__}: {str(erro)[:240]}). Sem repetição automática."
+        ) from erro
+
+    if not isinstance(resposta, dict):
+        raise VisitaIndeterminada(
+            f"VISITAR QUARTO {comando_id}: retorno inesperado: {resposta!r}"
+        )
+
+    for passo in resposta.get("trilha", [])[-20:]:
+        log(f"[Conta {account_id}] VISITAR QUARTO: {passo}", Fore.CYAN)
+
+    estado = resposta.get("estado")
+    decorrido = time.monotonic() - inicio
+    if estado == "clique_quarto":
+        nome = resposta.get("quartoSelecionado", "(sem nome)")
+        confianca = resposta.get("pontuacao", 0)
+        log(
+            f"[Conta {account_id}] 🚪 VISITAR QUARTO {comando_id}: "
+            f"clicou no quarto {nome!r} de {dono!r} "
+            f"(correspondência={confianca:.2f}; {decorrido:.1f}s). "
+            "Entrada no servidor não verificada.",
+            Fore.GREEN,
+        )
+    elif estado == "quarto_ausente":
+        log(
+            f"[Conta {account_id}] ⚠️ VISITAR QUARTO {comando_id}: "
+            f"nenhum quarto compatível de {dono!r} para {quarto!r}. "
+            f"Candidatos: {resposta.get('candidatos', [])}. Sem clique.",
+            Fore.YELLOW,
+        )
+    elif estado == "ambiguo":
+        log(
+            f"[Conta {account_id}] ⚠️ VISITAR QUARTO {comando_id}: "
+            f"mais de um quarto parecido; não escolhi ao acaso. "
+            f"Candidatos: {resposta.get('candidatos', [])}.",
+            Fore.YELLOW,
+        )
+    elif estado == "erro":
+        if resposta.get("clicouQuarto"):
+            raise VisitaIndeterminada(
+                f"VISITAR QUARTO {comando_id}: clique pode ter ocorrido; "
+                f"etapa={resposta.get('fase')}; erro={resposta.get('erro')}."
+            )
+        raise RuntimeError(
+            f"VISITAR QUARTO {comando_id}: fase={resposta.get('fase')}; "
+            f"erro={resposta.get('erro')}."
+        )
+    else:
+        raise RuntimeError(
+            f"VISITAR QUARTO {comando_id}: estado DOM não reconhecido: {resposta!r}"
+        )
+    marcar_etapa(account_id, "VISITAR QUARTO: ação finalizada.",
+                 Fore.GREEN, status="✅ Online", registrar=False)
+    return estado
+
+
+VISITAR_QUARTO_JS = r"""
+// Uma única chamada Selenium. Os eventos de input/change preservam o estado
+// de formulários controlados por React. A navegação real depende do Habblive.
+const dono = String(arguments[0] || '').trim();
+const quartoDesejado = String(arguments[1] || '').trim();
+const limiteMs = Number(arguments[2]) || 50000;
+const finalizarSelenium = arguments[arguments.length - 1];
+const inicio = performance.now();
+const trilha = [];
+let fase = 'inicial';
+let clicouQuarto = false;
+let terminou = false;
+
+function finalizar(estado, dados = {}) {
+    if (terminou) return;
+    terminou = true;
+    finalizarSelenium({
+        estado, fase, clicouQuarto,
+        tempoMs: Math.round(performance.now() - inicio),
+        trilha: trilha.slice(-30), ...dados
+    });
+}
+function texto(el) { return String(el?.textContent || '').replace(/\s+/g, ' ').trim(); }
+function normalizar(s) {
+    return String(s || '').normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[\u200b-\u200d\ufeff]/g, '')
+        .toLocaleLowerCase('pt-BR').replace(/[^a-z0-9]+/g, ' ').trim()
+        .replace(/\s+/g, ' ');
+}
+function visivel(el) {
+    if (!el || !el.isConnected) return false;
+    const s = getComputedStyle(el);
+    if (s.display === 'none' || s.visibility === 'hidden' ||
+        s.visibility === 'collapse' || s.pointerEvents === 'none') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+}
+function todos(seletor) {
+    return Array.from(document.querySelectorAll(seletor)).filter(visivel);
+}
+function primeiro(seletor) { return todos(seletor)[0] || null; }
+function dormir(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function restante() { return limiteMs - (performance.now() - inicio); }
+async function esperar(fn, prazoMs, intervalo = 150) {
+    const fim = performance.now() + Math.min(prazoMs, Math.max(0, restante() - 1000));
+    for (;;) {
+        if (restante() < 800) throw new Error('Tempo geral de visita esgotado.');
+        const obtido = fn();
+        if (obtido) return obtido;
+        if (performance.now() >= fim) return null;
+        await dormir(intervalo);
+    }
+}
+function clicar(el, descricao) {
+    if (!visivel(el)) throw new Error(`Elemento ausente/oculto: ${descricao}`);
+    el.click();
+    trilha.push('Clique: ' + descricao);
+}
+function selecionarDono() {
+    return todos('select.form-select.form-select-sm').find(el =>
+        Array.from(el.options || []).some(o =>
+            o.value === '2' && normalizar(o.textContent) === 'dono')) || null;
+}
+function campoBusca() {
+    return primeiro('input.form-control.form-control-sm[placeholder="filtrar quartos por"]') ||
+        primeiro('input[placeholder="filtrar quartos por"]');
+}
+function preencherInput(input, valor) {
+    if (!visivel(input) || input.disabled || input.readOnly) {
+        throw new Error('Campo de pesquisa do dono indisponível.');
+    }
+    input.focus({preventScroll: true});
+    const setValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setValue.call(input, valor);
+    try {
+        input.dispatchEvent(new InputEvent('input', {
+            bubbles: true, composed: true, data: valor, inputType: 'insertText'
+        }));
+    } catch (_) { input.dispatchEvent(new Event('input', {bubbles: true})); }
+    input.dispatchEvent(new Event('change', {bubbles: true}));
+}
+function alterarSelect(select, valor) {
+    const setValue = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+    setValue.call(select, valor);
+    select.dispatchEvent(new Event('input', {bubbles: true}));
+    select.dispatchEvent(new Event('change', {bubbles: true}));
+}
+function nomesQuartos() {
+    return todos('div.flex-grow-1.d-inline.text-black.text-truncate')
+        .map(el => ({el, nome: texto(el)})).filter(x => x.nome.length > 0);
+}
+function similaridadeEdicao(a, b) {
+    if (a === b) return 1;
+    if (!a || !b) return 0;
+    if (Math.abs(a.length - b.length) > Math.max(a.length, b.length) * 0.45) return 0;
+    let ant = Array.from({length: b.length + 1}, (_,i) => i);
+    for (let i = 1; i <= a.length; i++) {
+        const atual = [i];
+        for (let j = 1; j <= b.length; j++) {
+            atual[j] = Math.min(atual[j-1] + 1, ant[j] + 1,
+                ant[j-1] + (a[i-1] === b[j-1] ? 0 : 1));
+        }
+        ant = atual;
+    }
+    return 1 - ant[b.length] / Math.max(a.length, b.length);
+}
+function avaliar(nome) {
+    const q = normalizar(quartoDesejado);
+    const n = normalizar(nome);
+    if (!q || !n) return 0;
+    if (n === q) return 1;
+    if (n.startsWith(q)) return 0.94 - 0.09 * (n.length - q.length) / n.length;
+    if (n.includes(q)) return 0.87 - 0.07 * (n.length - q.length) / n.length;
+    if (q.length >= 5 && q.includes(n)) return 0.76;
+    if (q.length < 5) return 0;
+    return 0.83 * similaridadeEdicao(n, q);
+}
+function classificacao() {
+    const entradas = nomesQuartos();
+    return entradas.map(x => ({...x, pontuacao: avaliar(x.nome)}))
+        .sort((a,b) => b.pontuacao - a.pontuacao || a.nome.length - b.nome.length);
+}
+function decidir(ordenados) {
+    const melhores = ordenados.filter(x => x.pontuacao >= 0.65);
+    if (!melhores.length) return {tipo: 'ausente'};
+    const primeiro = melhores[0];
+    const segundo = melhores[1];
+    if (segundo && primeiro.pontuacao < 0.999 &&
+        (primeiro.pontuacao - segundo.pontuacao < 0.055) &&
+        normalizar(primeiro.nome) !== normalizar(segundo.nome)) {
+        return {tipo: 'ambiguo'};
+    }
+    return {tipo: 'escolhido', item: primeiro};
+}
+
+(async () => {
+    try {
+        if (!dono || !quartoDesejado) throw new Error('Dono/quarto vazios.');
+        fase = 'abrindo navegador de quartos';
+        let filtro = selecionarDono();
+        let busca = campoBusca();
+        // Se navegador já está aberto, não clicar no ícone: ele pode fechar a janela.
+        if (!filtro || !busca) {
+            const rooms = await esperar(() => primeiro('div.cursor-pointer.navigation-item.icon.icon-rooms'), 6500);
+            if (!rooms) throw new Error('Ícone icon-rooms não encontrado.');
+            clicar(rooms, 'navegador de quartos');
+        }
+
+        fase = 'selecionando filtro Dono';
+        filtro = await esperar(selecionarDono, 9000);
+        if (!filtro) throw new Error('Select do navegador com opção Dono (value=2) não apareceu.');
+        alterarSelect(filtro, '2');
+        await dormir(170);
+        if (filtro.isConnected && filtro.value !== '2') {
+            throw new Error('Filtro Dono não permaneceu selecionado.');
+        }
+        trilha.push('Filtro Dono (value=2) selecionado');
+
+        fase = 'preenchendo nome do dono';
+        busca = await esperar(campoBusca, 5000);
+        if (!busca) throw new Error('Campo filtrar quartos por não apareceu.');
+        preencherInput(busca, dono);
+        await dormir(230);
+        if (busca.isConnected && busca.value !== dono) {
+            throw new Error('O campo não manteve o nome do dono (interface controlada).');
+        }
+        trilha.push('Dono pesquisado: ' + dono);
+
+        fase = 'clicando botão de buscar';
+        const antes = nomesQuartos().map(x => x.nome).join('\u241f');
+        const contenedor = busca.closest('div.d-flex.w-100.gap-1') || busca.parentElement;
+        const botao = contenedor?.querySelector('.btn.btn-primary.btn-sm.btn-darkblue');
+        if (!botao || !visivel(botao)) {
+            throw new Error('Botão de pesquisa ao lado do campo não encontrado.');
+        }
+        clicar(botao, 'pesquisar quartos por dono');
+
+        fase = 'aguardando lista filtrada de quartos';
+        // O botão dispara uma consulta. Não escolher linhas antigas enquanto
+        // o React ainda está atualizando o resultado da pesquisa.
+        await dormir(700);
+        let ranking = [];
+        const buscaIniciada = performance.now();
+        const fim = performance.now() + Math.min(11000, Math.max(0, restante() - 1200));
+        while (performance.now() < fim) {
+            ranking = classificacao();
+            const depois = ranking.map(x => x.nome).join('\u241f');
+            const mudaramResultados = (depois !== antes);
+            const decorridoBusca = performance.now() - buscaIniciada;
+            const decisao = decidir(ranking);
+            // Se resultados permaneceram idênticos, aguarda um pouco mais
+            // para não clicar em um resultado possivelmente desatualizado.
+            if (decisao.tipo !== 'ausente' && (mudaramResultados || decorridoBusca > 2200)) {
+                break;
+            }
+            await dormir(220);
+        }
+        ranking = classificacao();
+        const resumo = ranking.slice(0, 5).map(x => ({
+            nome: x.nome, pontuacao: Number(x.pontuacao.toFixed(3))
+        }));
+        trilha.push('Quartos encontrados: ' + ranking.length);
+        const decisao = decidir(ranking);
+        if (decisao.tipo === 'ausente') {
+            finalizar('quarto_ausente', {candidatos: resumo});
+            return;
+        }
+        if (decisao.tipo === 'ambiguo') {
+            finalizar('ambiguo', {candidatos: resumo});
+            return;
+        }
+
+        fase = 'clicando quarto selecionado';
+        const item = decisao.item;
+        if (!visivel(item.el)) throw new Error('Quarto selecionado desapareceu da lista.');
+        clicouQuarto = true; // Se a navegação interromper a resposta, será incerta.
+        clicar(item.el, 'quarto ' + item.nome);
+        finalizar('clique_quarto', {
+            quartoSelecionado: item.nome,
+            pontuacao: Number(item.pontuacao.toFixed(3)),
+            candidatos: resumo
+        });
+    } catch (erro) {
+        finalizar('erro', {erro: String(erro?.message || erro), url: location.href});
+    }
+})();
+"""
+
+
 # ---------- Ação: IR AO CAFOFO ----------
 CASA_CSS = ".cursor-pointer.navigation-item.icon.icon-house"
 HABBO_CSS = ".cursor-pointer.navigation-item.icon.icon-habbo"
@@ -1071,14 +1397,14 @@ def processar_comando_da_fila(driver, account_id):
         fila.put((comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos))
         return
 
-    nome_acao = {"say": "FALAR", "go_home": "CAFOFO", "respect": "RESPEITAR"}.get(acao, acao)
-    status_acao = {"say": "💬 FALAR", "go_home": "🏠 CAFOFO", "respect": "🤝 RESPEITAR"}.get(acao, "🔄 Executando")
+    nome_acao = {"say": "FALAR", "go_home": "CAFOFO", "respect": "RESPEITAR", "visit_room": "VISITAR QUARTO"}.get(acao, acao)
+    status_acao = {"say": "💬 FALAR", "go_home": "🏠 CAFOFO", "respect": "🤝 RESPEITAR", "visit_room": "🚪 VISITAR QUARTO"}.get(acao, "🔄 Executando")
     if agora - criado_timestamp > COMMAND_MAX_AGE_SECONDS:
         log(f"[Conta {account_id}] {nome_acao} {comando_id} expirou.", Fore.YELLOW)
         return
 
     max_tentativas = {"say": FALAR_MAX_ATTEMPTS, "go_home": CAFOFO_MAX_ATTEMPTS,
-                      "respect": RESPEITAR_MAX_ATTEMPTS}.get(acao, 1)
+                      "respect": RESPEITAR_MAX_ATTEMPTS, "visit_room": 1}.get(acao, 1)
     tentativa_atual = tentativas + 1
     marcar_etapa(
         account_id,
@@ -1094,6 +1420,8 @@ def processar_comando_da_fila(driver, account_id):
             ir_ao_cafofo(driver, account_id, comando_id)
         elif acao == "respect":
             respeitar_usuario(driver, account_id, mensagem, comando_id)
+        elif acao == "visit_room":
+            visitar_quarto(driver, account_id, mensagem, comando_id)
         else:
             raise ValueError(f"Ação desconhecida na fila: {acao!r}")
 
@@ -1118,8 +1446,14 @@ def processar_comando_da_fila(driver, account_id):
                 "processamento do chooser finalizado nesta conta.",
                 Fore.GREEN,
             )
+        elif acao == "visit_room":
+            log(
+                f"[Conta {account_id}] VISITAR QUARTO {comando_id}: "
+                "processamento finalizado nesta conta.",
+                Fore.CYAN,
+            )
 
-    except (EnterIndeterminado, CliqueIndeterminado, RespeitoIndeterminado) as erro:
+    except (EnterIndeterminado, CliqueIndeterminado, RespeitoIndeterminado, VisitaIndeterminada) as erro:
         # Não repetir ações que podem já ter acontecido (ENTER ou clique).
         marcar_etapa(
             account_id, f"{nome_acao}: resultado da ação indeterminado.",
@@ -1218,11 +1552,20 @@ def monitorar_comandos(account_ids):
                     conhecidos.add(nome)
 
                     acao = str(comando.get("action", ""))
-                    if acao not in ("say", "go_home", "respect"):
+                    if acao not in ("say", "go_home", "respect", "visit_room"):
                         continue
 
-                    mensagem = (str(comando.get("message", "")) if acao == "say" else
-                                str(comando.get("target_name", "")).strip() if acao == "respect" else "")
+                    if acao == "say":
+                        mensagem = str(comando.get("message", ""))
+                    elif acao == "respect":
+                        mensagem = str(comando.get("target_name", "")).strip()
+                    elif acao == "visit_room":
+                        mensagem = {
+                            "owner": str(comando.get("room_owner", "")).strip(),
+                            "room": str(comando.get("room_name", "")).strip(),
+                        }
+                    else:
+                        mensagem = ""
                     alvos = set(int(item) for item in comando.get("targets", []))
                     alvos_locais = alvos.intersection(account_ids_set)
 
@@ -1233,6 +1576,13 @@ def monitorar_comandos(account_ids):
                     if acao == "respect" and (not mensagem or len(mensagem) > 60 or "\n" in mensagem or "\r" in mensagem):
                         log(f"Comando RESPEITAR inválido ou sem nome de usuário: {nome}", Fore.YELLOW)
                         continue
+                    if acao == "visit_room":
+                        dono = mensagem["owner"]
+                        quarto = mensagem["room"]
+                        if (not dono or len(dono) > 60 or not quarto or len(quarto) > 100
+                                or "\n" in dono + quarto or "\r" in dono + quarto):
+                            log(f"Comando VISITAR QUARTO inválido: {nome}", Fore.YELLOW)
+                            continue
 
                     data_criacao = comando.get("created_at")
                     if not data_criacao:
@@ -1270,7 +1620,7 @@ def monitorar_comandos(account_ids):
                         comandos_concluidos.setdefault(comando_id, set())
 
                     log(
-                        f"Novo comando { {'say': 'FALAR', 'go_home': 'CAFOFO', 'respect': 'RESPEITAR'}[acao] } recebido "
+                        f"Novo comando { {'say': 'FALAR', 'go_home': 'CAFOFO', 'respect': 'RESPEITAR', 'visit_room': 'VISITAR QUARTO'}[acao] } recebido "
                         f"({comando_id}) para contas {sorted(alvos_locais)}.",
                         Fore.CYAN
                     )

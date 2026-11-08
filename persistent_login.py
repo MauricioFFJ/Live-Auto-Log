@@ -27,11 +27,14 @@ from colorama import Fore, Style, init
 URL_BIGCLIENT = "https://habblive.in/bigclient/"
 # A sessão é verificada menos vezes para deixar o ChromeDriver livre para o chat.
 # A fila de GitHub usa requisições condicionais (ETag) para economizar cota.
-CHECK_INTERVAL = max(15, int(os.getenv("SESSION_CHECK_INTERVAL", "45")))
+CHECK_INTERVAL = max(15, int(os.getenv("SESSION_CHECK_INTERVAL", "60")))
 COMMAND_POLL_INTERVAL = max(5, int(os.getenv("COMMAND_POLL_INTERVAL", "10")))
 COMMANDS_PATH = "commands"
 COMMAND_MAX_AGE_SECONDS = 600  # comandos com mais de 10 minutos são ignorados
-COMMAND_MAX_ATTEMPTS = 5
+COMMAND_MAX_ATTEMPTS = 5  # Mantido para ações diferentes de FALAR.
+FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "2")))
+CHAT_MAX_SIMULTANEOS = 1  # Intencional: evita saturação ao digitar em 5 Chromes.
+CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "35")))
 COMMAND_RETRY_DELAY_SECONDS = max(1, int(os.getenv("COMMAND_RETRY_DELAY_SECONDS", "15")))
 CHAT_FIELD_TIMEOUT = max(3, int(os.getenv("CHAT_FIELD_TIMEOUT", "8")))
 CAFOFO_MENU_TIMEOUT = max(3, int(os.getenv("CAFOFO_MENU_TIMEOUT", "12")))
@@ -56,6 +59,11 @@ filas_comandos = {}  # Uma fila independente por conta.
 comandos_concluidos = {}  # IDs concluídos por conta.
 ultima_atividade = {}  # Momento da última etapa concluída/iniciada por conta.
 etapa_atividade = {}  # Etapa Selenium em andamento para localizar travamentos.
+
+# Só um FALAR por vez no mesmo runner (configurável) evita saturar
+# cinco navegadores com as mesmas operações pesadas do WebDriver.
+semaforo_falar = threading.BoundedSemaphore(CHAT_MAX_SIMULTANEOS)
+falar_ativo = threading.Event()  # Evita verificações de sessão durante o envio.
 
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
 GITHUB_TOKEN = os.getenv("COMMAND_GITHUB_TOKEN", "") or os.getenv("GITHUB_TOKEN", "")
@@ -318,74 +326,111 @@ def diagnosticar_chat(driver, account_id):
 
 
 def enviar_mensagem(driver, account_id, mensagem, comando_id):
-    """Envia via teclado real; reduz consultas ao WebDriver sem mudar a ação."""
+    """
+    FALAR otimizado para Chrome sob carga:
+    - Sem campo.click() (operação que travou por 120s nos logs).
+    - Sem campo.clear() (outra requisição remota).
+    - send_keys(Ctrl+A, texto) foca o input e substitui o conteúdo.
+    - ENTER separado para detectar resultado incerto sem duplicação automática.
+    - Limita o número de FALAR simultâneos por runner.
+    - Timeout HTTP específico do período de envio (se Selenium suportar).
+    """
     if not mensagem or len(mensagem) > 100:
         raise ValueError("Mensagem vazia ou maior que 100 caracteres.")
 
-    seletor = "input.chat-input[placeholder='Fale aqui...']"
-    inicio_total = time.monotonic()
-    marcar_etapa(account_id, "FALAR: procurando campo de conversa...", status="💬 FALAR")
-
-    # Antes: element_to_be_clickable fazia find_element + is_displayed +
-    # is_enabled a cada tentativa (até 3 requisições remotas). O campo do
-    # jogo já apareceu em testes reais; presence usa apenas find_element.
-    campo = WebDriverWait(driver, CHAT_FIELD_TIMEOUT, poll_frequency=0.4).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, seletor))
-    )
-    t_encontrado = time.monotonic()
+    inicio = time.monotonic()
     marcar_etapa(
         account_id,
-        f"FALAR: campo localizado em {t_encontrado - inicio_total:.1f}s.",
-        Fore.GREEN,
+        "FALAR: aguardando vez (evitando sobrecarga dos Chromes)...",
+        status="💬 FALAR",
     )
 
-    marcar_etapa(account_id, "FALAR: clicando no campo...")
-    campo.click()
-    t_clique = time.monotonic()
+    # O monitor já distribuiu o comando à thread da conta: esta espera não
+    # toca no WebDriver e não bloqueia outros serviços.
+    with semaforo_falar:
+        espera = time.monotonic() - inicio
+        falar_ativo.set()
 
-    marcar_etapa(account_id, "FALAR: limpando o campo...")
-    campo.clear()
-    t_limpeza = time.monotonic()
+        executor = getattr(driver, "command_executor", None)
+        client_config = getattr(executor, "client_config", None)
+        timeout_original = None
+        timeout_alterado = False
+        if client_config is not None:
+            try:
+                timeout_original = client_config.timeout
+                client_config.timeout = CHAT_HTTP_TIMEOUT
+                timeout_alterado = True
+            except Exception:
+                pass
 
-    marcar_etapa(account_id, "FALAR: digitando mensagem...")
-    campo.send_keys(mensagem)
-    t_digitacao = time.monotonic()
-
-    if CHAT_CONFIRMAR_TEXTO:
-        marcar_etapa(account_id, "FALAR: conferindo mensagem digitada...")
-        texto_digitado = campo.get_attribute("value")
-        if texto_digitado != mensagem:
-            raise RuntimeError(
-                f"Texto divergente (esperado={len(mensagem)}; "
-                f"campo={len(texto_digitado or '')})."
+        try:
+            inicio_chrome = time.monotonic()
+            marcar_etapa(
+                account_id,
+                f"FALAR: procurando chat (aguardou {espera:.1f}s na fila)...",
+            )
+            seletor = "input.chat-input[placeholder='Fale aqui...']"
+            campo = WebDriverWait(
+                driver, CHAT_FIELD_TIMEOUT, poll_frequency=0.4
+            ).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, seletor))
+            )
+            localizado = time.monotonic()
+            marcar_etapa(
+                account_id,
+                f"FALAR: campo encontrado em {localizado - inicio_chrome:.1f}s; "
+                "digitando SEM clicar...",
+                Fore.GREEN,
             )
 
-    # O ENTER continua em um comando separado para saber se um eventual
-    # timeout ocorreu antes ou durante o envio (evita reenvio duplicado).
-    marcar_etapa(account_id, "FALAR: mensagem digitada; pressionando ENTER...")
-    try:
-        campo.send_keys(Keys.ENTER)
-    except Exception as erro:
-        raise EnterIndeterminado(
-            f"Falha no ENTER do comando {comando_id}: {repr(erro)}"
-        ) from erro
-    t_enter = time.monotonic()
+            # WebElement.send_keys cuida do foco. Ctrl+A substitui eventual
+            # texto antigo. Não usamos click/clear nem eventos sintéticos JS.
+            campo.send_keys(Keys.CONTROL + "a", mensagem)
+            digitado = time.monotonic()
+            marcar_etapa(
+                account_id,
+                "FALAR: texto enviado ao campo; pressionando ENTER...",
+            )
 
-    marcar_etapa(
-        account_id,
-        f"FALAR: ENTER pressionado para {comando_id}.",
-        Fore.GREEN,
-        status="✅ Online",
-    )
-    log(
-        f"[Conta {account_id}] FALAR: tempos → buscar={t_encontrado-inicio_total:.1f}s; "
-        f"clicar={t_clique-t_encontrado:.1f}s; "
-        f"limpar={t_limpeza-t_clique:.1f}s; "
-        f"digitar={t_digitacao-t_limpeza:.1f}s; "
-        f"ENTER={t_enter-t_digitacao:.1f}s; "
-        f"total={t_enter-inicio_total:.1f}s.",
-        Fore.CYAN,
-    )
+            if CHAT_CONFIRMAR_TEXTO:
+                texto_atual = campo.get_attribute("value")
+                if texto_atual != mensagem:
+                    raise RuntimeError(
+                        "Conteúdo do chat não corresponde ao texto pedido."
+                    )
+
+            try:
+                campo.send_keys(Keys.ENTER)
+            except Exception as erro:
+                # Um timeout durante ENTER não revela se a mensagem saiu.
+                # Repetir automaticamente poderia mandar duas mensagens.
+                raise EnterIndeterminado(
+                    f"Não foi possível confirmar ENTER de {comando_id}: "
+                    f"{type(erro).__name__}: {str(erro)[:220]}"
+                ) from erro
+
+            final = time.monotonic()
+            marcar_etapa(
+                account_id,
+                f"FALAR: ENTER enviado para {comando_id}.",
+                Fore.GREEN, status="✅ Online",
+            )
+            log(
+                f"[Conta {account_id}] FALAR: tempos → "
+                f"espera_na_fila={espera:.1f}s; "
+                f"buscar={localizado-inicio_chrome:.1f}s; "
+                f"digitar={digitado-localizado:.1f}s; "
+                f"ENTER={final-digitado:.1f}s; "
+                f"total={final-inicio:.1f}s.",
+                Fore.CYAN,
+            )
+        finally:
+            if timeout_alterado:
+                try:
+                    client_config.timeout = timeout_original
+                except Exception:
+                    pass
+            falar_ativo.clear()
 
 
 # ---------- Ação: IR AO CAFOFO ----------
@@ -493,11 +538,12 @@ def processar_comando_da_fila(driver, account_id):
         log(f"[Conta {account_id}] {nome_acao} {comando_id} expirou.", Fore.YELLOW)
         return
 
+    max_tentativas = FALAR_MAX_ATTEMPTS if acao == "say" else COMMAND_MAX_ATTEMPTS
     tentativa_atual = tentativas + 1
     marcar_etapa(
         account_id,
         f"{nome_acao}: iniciando comando {comando_id}, tentativa "
-        f"{tentativa_atual}/{COMMAND_MAX_ATTEMPTS}.",
+        f"{tentativa_atual}/{max_tentativas}.",
         status=status_acao,
     )
 
@@ -540,10 +586,23 @@ def processar_comando_da_fila(driver, account_id):
             Fore.YELLOW,
         )
         if acao == "say" and isinstance(erro, TimeoutException):
+            # Diagnóstico DOM custa várias chamadas remotas; só tente se
+            # a falha foi na espera pelo campo, não em um clique/ENTER.
             diagnosticar_chat(driver, account_id)
+        if acao == "say" and (
+            type(erro).__name__ == "ReadTimeoutError"
+            or "Read timed out" in str(erro)
+        ):
+            log(
+                f"[Conta {account_id}] ChromeDriver não respondeu dentro do "
+                f"limite HTTP (configurado em {CHAT_HTTP_TIMEOUT}s). "
+                "Isso normalmente indica navegador/runner sobrecarregado; "
+                "repetições não corrigem a causa raiz.",
+                Fore.RED,
+            )
 
         idade = time.time() - criado_timestamp
-        if tentativa_atual < COMMAND_MAX_ATTEMPTS and idade < COMMAND_MAX_AGE_SECONDS:
+        if tentativa_atual < max_tentativas and idade < COMMAND_MAX_AGE_SECONDS:
             proxima = time.time() + COMMAND_RETRY_DELAY_SECONDS
             fila.put((comando_id, acao, mensagem, criado_timestamp,
                       tentativa_atual, proxima))
@@ -872,7 +931,8 @@ def iniciar_sessao(username, password, index):
                 # Não iniciar verificação de sessão com ações esperando na fila.
                 fila_pessoal = filas_comandos.get(index)
                 if (time.monotonic() >= proxima_verificacao
-                        and (fila_pessoal is None or fila_pessoal.empty())):
+                        and (fila_pessoal is None or fila_pessoal.empty())
+                        and not falar_ativo.is_set()):
                     continuar, cliente_ausente_desde = verificar_sessao(
                         driver, index, cliente_ausente_desde,
                     )

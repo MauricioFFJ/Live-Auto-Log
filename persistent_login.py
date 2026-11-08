@@ -36,6 +36,7 @@ CAFOFO_MAX_ATTEMPTS = max(1, int(os.getenv("CAFOFO_MAX_ATTEMPTS", "2")))
 RESPEITAR_MAX_ATTEMPTS = 1  # Nunca repetir automaticamente uma acao que consome respeitos.
 RESPEITAR_SCRIPT_TIMEOUT = max(85, int(os.getenv("RESPEITAR_SCRIPT_TIMEOUT", "105")))
 VISITAR_QUARTO_SCRIPT_TIMEOUT = max(30, int(os.getenv("VISITAR_QUARTO_SCRIPT_TIMEOUT", "60")))
+TRATAR_CARINHOS_SCRIPT_TIMEOUT = max(120, int(os.getenv("TRATAR_CARINHOS_SCRIPT_TIMEOUT", "480")))
 FALAR_MAX_ATTEMPTS = max(1, int(os.getenv("FALAR_MAX_ATTEMPTS", "1")))  # Evita várias tentativas longas em Chrome travado.
 CHAT_MAX_SIMULTANEOS = max(1, int(os.getenv("CHAT_MAX_SIMULTANEOS", "5")))  # Contas independentes: sem fila global por padrão.
 CHAT_HTTP_TIMEOUT = max(15, int(os.getenv("CHAT_HTTP_TIMEOUT", "25")))
@@ -117,7 +118,7 @@ def painel_status(account_ids):
                 # Um navegador ocioso/Online não está travado só porque passou
                 # algum tempo sem uma operação Selenium. Alertar apenas quando
                 # houver uma operação efetivamente em andamento.
-                operacao_ativa = (estado in ("💬 FALAR", "🏠 CAFOFO", "🤝 RESPEITAR", "🚪 VISITAR QUARTO") or etapa.startswith(
+                operacao_ativa = (estado in ("💬 FALAR", "🏠 CAFOFO", "🤝 RESPEITAR", "🚪 VISITAR QUARTO", "🌿 TRATAR E CARINHOS") or etapa.startswith(
                     ("Sessão: consultando", "Criando ChromeDriver", "Abrindo", "Preenchendo")))
                 if ultima is not None and operacao_ativa:
                     sem_progresso = int(agora - ultima)
@@ -1178,6 +1179,355 @@ function decidir(ordenados) {
 """
 
 
+
+# ---------- Ação: TRATAR E CARINHOS ----------
+class CarinhosIndeterminado(Exception):
+    """A interface pode ter executado cliques sem confirmar a resposta HTTP."""
+
+
+def tratar_e_carinhos(driver, account_id, comando_id):
+    """Percorre dinamicamente cada linha de mascote/planta do :chooser.
+
+    Mantém nomes repetidos como entradas distintas, clica Tratar uma vez ou
+    Acaricia (X) até o contador sumir, e fecha o chooser ao final.
+
+    Executa JS assíncrono em uma única interação com o ChromeDriver para
+    reduzir chamadas remotas; não reexecuta toda a sequência ao falhar.
+    """
+    inicio = time.monotonic()
+    marcar_etapa(
+        account_id,
+        f"TRATAR E CARINHOS: abrindo :chooser ({comando_id})...",
+        status="🌿 TRATAR E CARINHOS",
+    )
+
+    try:
+        # Reutiliza exatamente o mecanismo de teclado funcional do FALAR.
+        enviar_mensagem(driver, account_id, ":chooser", f"{comando_id}:chooser")
+    except Exception as erro:
+        raise CarinhosIndeterminado(
+            f"TRATAR E CARINHOS {comando_id}: envio do :chooser incerto; "
+            f"não será repetido ({type(erro).__name__}: {str(erro)[:180]})."
+        ) from erro
+
+    marcar_etapa(
+        account_id,
+        "TRATAR E CARINHOS: filtrando mascotes e processando linhas da lista...",
+        status="🌿 TRATAR E CARINHOS",
+    )
+
+    # O chooser pode ter dezenas de animais. Aumentar também o limite de HTTP
+    # evita que o transporte do Selenium cancele uma operação JS ainda ativa.
+    executor = getattr(driver, "command_executor", None)
+    client_config = getattr(executor, "client_config", None)
+    timeout_anterior = None
+    timeout_alterado = False
+    if client_config is not None:
+        try:
+            timeout_anterior = client_config.timeout
+            client_config.timeout = TRATAR_CARINHOS_SCRIPT_TIMEOUT + 30
+            timeout_alterado = True
+        except Exception:
+            pass
+
+    try:
+        driver.set_script_timeout(TRATAR_CARINHOS_SCRIPT_TIMEOUT)
+        resposta = driver.execute_async_script(
+            TRATAR_CARINHOS_JS,
+            (TRATAR_CARINHOS_SCRIPT_TIMEOUT - 15) * 1000,
+        )
+    except Exception as erro:
+        raise CarinhosIndeterminado(
+            f"TRATAR E CARINHOS {comando_id}: execução sem resposta confirmada "
+            f"({type(erro).__name__}: {str(erro)[:230]}). "
+            "Não vou reiniciar a lista porque alguns cliques podem já ter ocorrido."
+        ) from erro
+    finally:
+        if timeout_alterado:
+            try:
+                client_config.timeout = timeout_anterior
+            except Exception:
+                pass
+
+    if not isinstance(resposta, dict):
+        raise CarinhosIndeterminado(
+            f"TRATAR E CARINHOS {comando_id}: resposta inesperada: {resposta!r}"
+        )
+
+    for detalhe in resposta.get("anotacoes", []):
+        log(f"[Conta {account_id}] CARINHOS: {detalhe}", Fore.CYAN)
+
+    estado = resposta.get("estado", "desconhecido")
+    qtd = resposta.get("total", 0)
+    proc = resposta.get("processados", 0)
+    tratados = resposta.get("tratados", 0)
+    carinhos = resposta.get("carinhos", 0)
+    erros = resposta.get("erros", 0)
+    fechou = resposta.get("fechado", False)
+    duracao = time.monotonic() - inicio
+
+    log(
+        f"[Conta {account_id}] TRATAR E CARINHOS {comando_id}: "
+        f"estado={estado}; itens={qtd}; processados={proc}; "
+        f"tratados={tratados}; carinhos={carinhos}; erros={erros}; "
+        f"fechou={fechou}; tempo={duracao:.1f}s.",
+        Fore.GREEN if estado in ("concluido", "sem_mascotes") else Fore.YELLOW,
+    )
+
+    if estado not in ("concluido", "parcial", "sem_mascotes"):
+        raise CarinhosIndeterminado(
+            f"TRATAR E CARINHOS {comando_id}: encerramento incompleto; "
+            f"fase={resposta.get('fase')!r}, erro={resposta.get('erro')!r}. "
+            "Ação NÃO será repetida automaticamente."
+        )
+
+    if not fechou:
+        log(
+            f"[Conta {account_id}] AVISO: chooser possivelmente ainda aberto; "
+            "fechamento não confirmado.",
+            Fore.YELLOW,
+        )
+    return estado
+
+
+TRATAR_CARINHOS_JS = r"""
+const responder = arguments[arguments.length - 1];
+const limiteMs = Math.max(15000, Number(arguments[0]) || 360000);
+const inicio = performance.now();
+const anotacoes = [];
+const estatisticas = { total: 0, processados: 0, tratados: 0, carinhos: 0, sem_acao: 0, erros: 0 };
+let fase = 'inicializando';
+let jaRespondeu = false;
+
+function terminar(estado, extras = {}) {
+    if (jaRespondeu) return;
+    jaRespondeu = true;
+    responder({ estado, fase, ...estatisticas, anotacoes: anotacoes.slice(0, 160), ...extras });
+}
+function registrar(mensagem) {
+    if (anotacoes.length < 160) anotacoes.push(String(mensagem));
+}
+function texto(el) { return (el && el.textContent || '').trim().replace(/\s+/g, ' '); }
+function normalizar(s) { return String(s || '').trim().toLocaleLowerCase('pt-BR'); }
+function visivel(el) {
+    if (!el || !el.isConnected) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+    return el.getClientRects().length > 0;
+}
+function esperar(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+function restante() { return limiteMs - (performance.now() - inicio); }
+async function aguardarAte(fn, ms, intervalo = 120) {
+    const fim = performance.now() + ms;
+    for (;;) {
+        if (restante() < 2200) throw new Error('Limite de tempo da automacao atingido.');
+        const valor = fn();
+        if (valor) return valor;
+        if (performance.now() >= fim) return null;
+        await esperar(intervalo);
+    }
+}
+function seletorMascote() {
+    return Array.from(document.querySelectorAll('select.form-select.form-select-sm'))
+        .find(sel => visivel(sel) && Array.from(sel.options).some(op => op.value === 'mascote')) || null;
+}
+function raizChooser() {
+    const select = seletorMascote();
+    if (!select) return null;
+    const card = select.closest('.nitro-card') || select.closest('[class*="nitro-card"]');
+    // O filtro e as linhas podem estar em um unico painel; fallback para document.
+    if (card && card.querySelector('tr.rounded.p-1')) return card;
+    return document;
+}
+function linhasMascotes() {
+    const raiz = raizChooser();
+    if (!raiz) return [];
+    const linhas = Array.from(raiz.querySelectorAll('tr.rounded.p-1'));
+    return linhas.filter(tr => {
+        if (!visivel(tr)) return false;
+        const cols = tr.querySelectorAll('td');
+        if (cols.length < 2) return false;
+        const nome = tr.querySelector('td:first-child .d-inline.text-black.text-truncate');
+        return !!nome && !!texto(nome) && /mascote|planta/i.test(texto(cols[1]));
+    });
+}
+function nomeDaLinha(tr) {
+    return texto(tr && tr.querySelector('td:first-child .d-inline.text-black.text-truncate'));
+}
+function inventario() {
+    const ocorrencias = new Map();
+    return linhasMascotes().map((tr, indice) => {
+        const nome = nomeDaLinha(tr);
+        const chave = normalizar(nome);
+        const ocorrencia = ocorrencias.get(chave) || 0;
+        ocorrencias.set(chave, ocorrencia + 1);
+        return { nome, indice, ocorrencia, linhaOriginal: tr };
+    });
+}
+function localizarLinha(item) {
+    const linhas = linhasMascotes();
+    if (item.linhaOriginal && linhas.includes(item.linhaOriginal)) return item.linhaOriginal;
+    const naPosicao = linhas[item.indice];
+    if (naPosicao && normalizar(nomeDaLinha(naPosicao)) === normalizar(item.nome)) return naPosicao;
+    // Evita confundir itens com nomes repetidos. Só usa o mesmo ordinal de nome.
+    const iguais = linhas.filter(tr => normalizar(nomeDaLinha(tr)) === normalizar(item.nome));
+    return iguais[item.ocorrencia] || null;
+}
+function opcoes() {
+    const menu = Array.from(document.querySelectorAll('.nitro-context-menu.visible'))
+        .find(visivel);
+    const op = Array.from((menu || document).querySelectorAll('div.menu-item.list-item'))
+        .filter(visivel);
+    for (const el of op) {
+        const t = texto(el);
+        if (/^tratar$/i.test(t)) return { tipo: 'tratar', el };
+        const m = t.match(/^acarici(?:a|ar)\s*\(\s*(\d+)\s*\)$/i);
+        if (m) return { tipo: 'acariciar', el, quantidade: Number(m[1]) };
+    }
+    return null;
+}
+function clicar(el, descricao) {
+    if (!el || !el.isConnected) throw new Error('Elemento indisponivel: ' + descricao);
+    el.click();
+}
+async function abrirOpcoes(item, tentativas = 2) {
+    for (let i = 0; i < tentativas; i++) {
+        const linha = localizarLinha(item);
+        if (!linha) throw new Error('Mascote desapareceu da lista: ' + item.nome + ' #' + (item.ocorrencia + 1));
+        const nome = linha.querySelector('td:first-child .d-inline.text-black.text-truncate') || linha;
+        // O click no nome propaga para a tr, onde o chooser geralmente registra onClick.
+        clicar(nome, 'selecionar ' + item.nome);
+        await esperar(180);
+        const opcao = await aguardarAte(opcoes, 850);
+        if (opcao) return opcao;
+    }
+    return null;
+}
+async function consumirCarinhos(item, opcaoInicial) {
+    let opcao = opcaoInicial;
+    let cliques = 0;
+    const limiteCliques = 15;
+    while (cliques < limiteCliques) {
+        if (opcao && opcao.tipo !== 'acariciar') return cliques;
+        if (!opcao) {
+            opcao = await abrirOpcoes(item, 2);
+            if (!opcao || opcao.tipo !== 'acariciar') return cliques;
+        }
+        const antes = opcao.quantidade;
+        if (!Number.isInteger(antes) || antes < 1 || antes > 99) {
+            throw new Error('Contador Acaricia invalido: ' + antes);
+        }
+        clicar(opcao.el, 'Acaricia (' + antes + ')');
+        cliques++;
+        estatisticas.carinhos++;
+        await esperar(180);
+        // Verifica se o contador caiu ou se a opcao sumiu.
+        let nova = opcoes();
+        if (nova && nova.tipo === 'acariciar' && nova.quantidade >= antes) {
+            nova = await aguardarAte(() => {
+                const atual = opcoes();
+                return (!atual || atual.tipo !== 'acariciar' || atual.quantidade < antes) ? { atual } : null;
+            }, 1800);
+            nova = nova ? nova.atual : opcoes();
+        }
+        if (nova && nova.tipo === 'acariciar') {
+            if (nova.quantidade >= antes) {
+                throw new Error('Contador nao diminuiu de ' + antes + '; nao vou repetir clique incerto.');
+            }
+            opcao = nova;
+            continue;
+        }
+        // Alguns menus fecham apos cada clique; reabre para confirmar o contador.
+        const reaberto = await abrirOpcoes(item, 1);
+        if (!reaberto || reaberto.tipo !== 'acariciar') return cliques;
+        if (reaberto.quantidade >= antes) {
+            const diminuiu = await aguardarAte(() => {
+                const a = opcoes();
+                return a && a.tipo === 'acariciar' && a.quantidade < antes ? a : null;
+            }, 1350);
+            if (!diminuiu) throw new Error('Contador nao baixou apos reabrir o menu; sem repetir.');
+            opcao = diminuiu;
+        } else {
+            opcao = reaberto;
+        }
+    }
+    throw new Error('Limite de 15 cliques Acaricia atingido; interrompido por seguranca.');
+}
+function fecharChooser() {
+    const select = seletorMascote();
+    const card = select && (select.closest('.nitro-card') || select.closest('[class*="nitro-card"]'));
+    const botoes = Array.from(document.querySelectorAll(
+        'div.d-flex.position-absolute.align-items-center.justify-content-center.end-2.nitro-card-header-close, .nitro-card-header-close'
+    )).filter(visivel);
+    const botao = (card && botoes.find(el => card.contains(el))) || botoes[botoes.length - 1];
+    if (!botao) return false;
+    clicar(botao, 'fechar chooser');
+    return true;
+}
+
+(async () => {
+    try {
+        fase = 'aguardando :chooser';
+        const seletor = await aguardarAte(seletorMascote, 12000);
+        if (!seletor) throw new Error('Seletor de tipos do chooser nao apareceu apos :chooser.');
+        fase = 'selecionando tipo mascote';
+        const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+        setter.call(seletor, 'mascote');
+        seletor.dispatchEvent(new Event('input', { bubbles: true }));
+        seletor.dispatchEvent(new Event('change', { bubbles: true }));
+        registrar('Filtro mascote selecionado.');
+        await esperar(450);
+        if (seletor.value !== 'mascote') throw new Error('O filtro nao permaneceu em mascote.');
+
+        fase = 'carregando lista';
+        // A lista pode estar vazia. Aguarda ate 8s, sem misturar com outros tipos.
+        await aguardarAte(() => linhasMascotes().length > 0, 8000);
+        const itens = inventario();
+        estatisticas.total = itens.length;
+        registrar('Encontrados ' + itens.length + ' mascotes/plantas (nomes repetidos incluidos).');
+        if (itens.length > 150) throw new Error('Mais de 150 itens; interrompido por seguranca.');
+        if (!itens.length) {
+            fase = 'fechando chooser sem itens';
+            const fechado = fecharChooser();
+            terminar('sem_mascotes', { fechado });
+            return;
+        }
+        for (const item of itens) {
+            if (restante() < 4000) throw new Error('Tempo insuficiente para concluir toda a lista.');
+            fase = 'processando ' + item.nome + ' #' + (item.ocorrencia + 1);
+            try {
+                const opcao = await abrirOpcoes(item, 2);
+                if (!opcao) {
+                    estatisticas.sem_acao++;
+                    registrar(item.nome + ' #' + (item.ocorrencia + 1) + ': sem Tratar/Acaricia.');
+                } else if (opcao.tipo === 'tratar') {
+                    clicar(opcao.el, 'Tratar ' + item.nome);
+                    estatisticas.tratados++;
+                    registrar(item.nome + ' #' + (item.ocorrencia + 1) + ': tratado.');
+                    await esperar(220);
+                } else {
+                    const quantidade = await consumirCarinhos(item, opcao);
+                    registrar(item.nome + ' #' + (item.ocorrencia + 1) + ': ' + quantidade + ' carinho(s).');
+                }
+                estatisticas.processados++;
+            } catch (erroItem) {
+                estatisticas.erros++;
+                registrar(item.nome + ' #' + (item.ocorrencia + 1) + ': ERRO ' + String(erroItem?.message || erroItem));
+                // Item com resultado incerto fica sem repeticao; segue para o proximo.
+            }
+            await esperar(120);
+        }
+        fase = 'fechando chooser';
+        const fechado = fecharChooser();
+        terminar(estatisticas.erros ? 'parcial' : 'concluido', { fechado });
+    } catch (erro) {
+        try { fecharChooser(); } catch (_) {}
+        terminar('incompleto', { erro: String(erro?.message || erro), url: location.href });
+    }
+})();
+"""
+
+
 # ---------- Ação: IR AO CAFOFO ----------
 CASA_CSS = ".cursor-pointer.navigation-item.icon.icon-house"
 HABBO_CSS = ".cursor-pointer.navigation-item.icon.icon-habbo"
@@ -1397,14 +1747,14 @@ def processar_comando_da_fila(driver, account_id):
         fila.put((comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos))
         return
 
-    nome_acao = {"say": "FALAR", "go_home": "CAFOFO", "respect": "RESPEITAR", "visit_room": "VISITAR QUARTO"}.get(acao, acao)
-    status_acao = {"say": "💬 FALAR", "go_home": "🏠 CAFOFO", "respect": "🤝 RESPEITAR", "visit_room": "🚪 VISITAR QUARTO"}.get(acao, "🔄 Executando")
+    nome_acao = {"say": "FALAR", "go_home": "CAFOFO", "respect": "RESPEITAR", "visit_room": "VISITAR QUARTO", "treat_pets": "TRATAR E CARINHOS"}.get(acao, acao)
+    status_acao = {"say": "💬 FALAR", "go_home": "🏠 CAFOFO", "respect": "🤝 RESPEITAR", "visit_room": "🚪 VISITAR QUARTO", "treat_pets": "🌿 TRATAR E CARINHOS"}.get(acao, "🔄 Executando")
     if agora - criado_timestamp > COMMAND_MAX_AGE_SECONDS:
         log(f"[Conta {account_id}] {nome_acao} {comando_id} expirou.", Fore.YELLOW)
         return
 
     max_tentativas = {"say": FALAR_MAX_ATTEMPTS, "go_home": CAFOFO_MAX_ATTEMPTS,
-                      "respect": RESPEITAR_MAX_ATTEMPTS, "visit_room": 1}.get(acao, 1)
+                      "respect": RESPEITAR_MAX_ATTEMPTS, "visit_room": 1, "treat_pets": 1}.get(acao, 1)
     tentativa_atual = tentativas + 1
     marcar_etapa(
         account_id,
@@ -1422,6 +1772,8 @@ def processar_comando_da_fila(driver, account_id):
             respeitar_usuario(driver, account_id, mensagem, comando_id)
         elif acao == "visit_room":
             visitar_quarto(driver, account_id, mensagem, comando_id)
+        elif acao == "treat_pets":
+            tratar_e_carinhos(driver, account_id, comando_id)
         else:
             raise ValueError(f"Ação desconhecida na fila: {acao!r}")
 
@@ -1452,8 +1804,14 @@ def processar_comando_da_fila(driver, account_id):
                 "processamento finalizado nesta conta.",
                 Fore.CYAN,
             )
+        elif acao == "treat_pets":
+            log(
+                f"[Conta {account_id}] TRATAR E CARINHOS {comando_id}: "
+                "lista percorrida nesta conta (conferir resumo de erros).",
+                Fore.GREEN,
+            )
 
-    except (EnterIndeterminado, CliqueIndeterminado, RespeitoIndeterminado, VisitaIndeterminada) as erro:
+    except (EnterIndeterminado, CliqueIndeterminado, RespeitoIndeterminado, VisitaIndeterminada, CarinhosIndeterminado) as erro:
         # Não repetir ações que podem já ter acontecido (ENTER ou clique).
         marcar_etapa(
             account_id, f"{nome_acao}: resultado da ação indeterminado.",
@@ -1552,7 +1910,7 @@ def monitorar_comandos(account_ids):
                     conhecidos.add(nome)
 
                     acao = str(comando.get("action", ""))
-                    if acao not in ("say", "go_home", "respect", "visit_room"):
+                    if acao not in ("say", "go_home", "respect", "visit_room", "treat_pets"):
                         continue
 
                     if acao == "say":
@@ -1620,7 +1978,7 @@ def monitorar_comandos(account_ids):
                         comandos_concluidos.setdefault(comando_id, set())
 
                     log(
-                        f"Novo comando { {'say': 'FALAR', 'go_home': 'CAFOFO', 'respect': 'RESPEITAR', 'visit_room': 'VISITAR QUARTO'}[acao] } recebido "
+                        f"Novo comando { {'say': 'FALAR', 'go_home': 'CAFOFO', 'respect': 'RESPEITAR', 'visit_room': 'VISITAR QUARTO', 'treat_pets': 'TRATAR E CARINHOS'}[acao] } recebido "
                         f"({comando_id}) para contas {sorted(alvos_locais)}.",
                         Fore.CYAN
                     )

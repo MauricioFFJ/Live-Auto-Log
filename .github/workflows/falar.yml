@@ -1,4 +1,4 @@
-name: FALAR
+name: Comando: Falar frase
 
 on:
   workflow_dispatch:

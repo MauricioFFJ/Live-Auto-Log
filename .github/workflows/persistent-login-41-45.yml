@@ -9,6 +9,10 @@ concurrency:
   group: persistent-login-41-45
   cancel-in-progress: false # Evita execução simultânea; nova espera a anterior terminar
 
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   persistent-login-41-45:
     if: ${{ vars.HABILITAR_REINICIO == 'true' }}
@@ -39,6 +43,9 @@ jobs:
           HABBLIVE_PASSWORD_44: ${{ secrets.HABBLIVE_PASSWORD_44 }}
           HABBLIVE_USERNAME_45: ${{ secrets.HABBLIVE_USERNAME_45 }}
           HABBLIVE_PASSWORD_45: ${{ secrets.HABBLIVE_PASSWORD_45 }}
+          ACCOUNT_IDS: "41,42,43,44,45"
+          COMMAND_POLL_INTERVAL: "20"
+          COMMAND_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python persistent_login.py
 
       - name: Auto-disparo para reinício imediato

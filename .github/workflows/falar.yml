@@ -103,7 +103,14 @@ jobs:
             }
 
             const contas = selecionados.flatMap(g => g.contas);
-            const id = `${context.run_id}-${context.run_attempt}`;
+            // Os identificadores de execução são variáveis de ambiente do runner.
+            const runId = process.env.GITHUB_RUN_ID;
+            const runAttempt = process.env.GITHUB_RUN_ATTEMPT || '1';
+            if (!runId) {
+              core.setFailed('Não foi possível obter GITHUB_RUN_ID.');
+              return;
+            }
+            const id = `${runId}-${runAttempt}`;
             const comando = {
               id,
               action: 'say',

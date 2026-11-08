@@ -6,6 +6,7 @@ import base64
 import queue
 import urllib.request
 import urllib.error
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 from selenium import webdriver
@@ -21,14 +22,19 @@ from colorama import Fore, Style, init
 
 # ===== CONFIGURAÇÃO =====
 URL_BIGCLIENT = "https://habblive.in/bigclient/"
-CHECK_INTERVAL = 15  # segundos entre verificações da sessão
-COMMAND_POLL_INTERVAL = int(os.getenv("COMMAND_POLL_INTERVAL", "20"))
+# A sessão é verificada menos vezes para deixar o ChromeDriver livre para o chat.
+# A fila de GitHub usa requisições condicionais (ETag) para economizar cota.
+CHECK_INTERVAL = max(15, int(os.getenv("SESSION_CHECK_INTERVAL", "45")))
+COMMAND_POLL_INTERVAL = max(5, int(os.getenv("COMMAND_POLL_INTERVAL", "10")))
 COMMANDS_PATH = "commands"
 COMMAND_MAX_AGE_SECONDS = 600  # comandos com mais de 10 minutos são ignorados
 COMMAND_MAX_ATTEMPTS = 5
 COMMAND_RETRY_DELAY_SECONDS = max(1, int(os.getenv("COMMAND_RETRY_DELAY_SECONDS", "15")))
-CHAT_FIELD_TIMEOUT = max(3, int(os.getenv("CHAT_FIELD_TIMEOUT", "12")))
-DEBUG_SESSAO = os.getenv("DEBUG_SESSAO", "1").strip().lower() not in ("0", "false", "no")
+CHAT_FIELD_TIMEOUT = max(3, int(os.getenv("CHAT_FIELD_TIMEOUT", "8")))
+# A leitura do valor digitado acrescenta uma chamada ao Selenium; desligada
+# para priorizar velocidade, mas pode ser reativada se houver inconsistências.
+CHAT_CONFIRMAR_TEXTO = os.getenv("CHAT_CONFIRMAR_TEXTO", "0").lower() in ("1", "true", "yes")
+DEBUG_SESSAO = os.getenv("DEBUG_SESSAO", "0").strip().lower() not in ("0", "false", "no")
 EXECUTAR_ACOES = False  # True = faz ações no quarto, False = só loga/reloga
 
 # Configurações personalizadas
@@ -78,7 +84,12 @@ def painel_status(account_ids):
                 etapa = etapa_atividade.get(account_id, "sem etapa registrada")
                 # O painel não deve continuar afirmando 'Online' se a thread
                 # estiver presa em uma chamada Selenium por muito tempo.
-                if ultima is not None and estado not in ("⏳ Iniciando", "🔄 Relogando"):
+                # Um navegador ocioso/Online não está travado só porque passou
+                # algum tempo sem uma operação Selenium. Alertar apenas quando
+                # houver uma operação efetivamente em andamento.
+                operacao_ativa = (estado == "💬 FALAR" or etapa.startswith(
+                    ("Sessão: consultando", "Criando ChromeDriver", "Abrindo", "Preenchendo")))
+                if ultima is not None and operacao_ativa:
                     sem_progresso = int(agora - ultima)
                     if sem_progresso >= 45:
                         estado = f"⚠️ Sem progresso há {sem_progresso}s ({etapa[:38]})"
@@ -224,42 +235,52 @@ def executar_acoes_no_quarto(driver, index):
 
 
 # ---------- GitHub: recebimento e distribuição de comandos ----------
-def github_api_request(path):
-    """Consulta a API de conteúdo do repositório onde a fila é gravada."""
+def github_api_request(path, etag=None):
+    """Obtém conteúdo com cache condicional. Retorna (dados, etag, sem_mudanças)."""
     if not GITHUB_REPOSITORY or not GITHUB_TOKEN:
         raise RuntimeError("GITHUB_REPOSITORY ou COMMAND_GITHUB_TOKEN/GITHUB_TOKEN não configurado.")
 
-    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/{path}?ref={GITHUB_REF_NAME}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {GITHUB_TOKEN}",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "Habblive-Persistent-Login",
-        },
-    )
+    caminho = quote(path, safe="/")
+    branch = quote(GITHUB_REF_NAME, safe="")
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/{caminho}?ref={branch}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Habblive-Persistent-Login",
+    }
+    if etag:
+        headers["If-None-Match"] = etag
+
+    request = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            return json.loads(response.read().decode("utf-8"))
+            dados = json.loads(response.read().decode("utf-8"))
+            return dados, response.headers.get("ETag"), False
     except urllib.error.HTTPError as error:
+        if error.code == 304:
+            return None, etag, True
         if error.code == 404:
-            return None
+            return None, None, False
         raise
 
 
-def listar_arquivos_comandos():
-    resultado = github_api_request(COMMANDS_PATH)
-    if resultado is None or not isinstance(resultado, list):
-        return []
-    return [
+def listar_arquivos_comandos(etag=None):
+    """Retorna (arquivos, etag_atual, não_modificado)."""
+    resultado, etag_atual, nao_modificado = github_api_request(COMMANDS_PATH, etag)
+    if nao_modificado:
+        return [], etag_atual, True
+    if not isinstance(resultado, list):
+        return [], etag_atual, False
+    arquivos = [
         item for item in resultado
         if item.get("type") == "file" and item.get("name", "").endswith(".json")
     ]
+    return arquivos, etag_atual, False
 
 
 def obter_comando(caminho):
-    resultado = github_api_request(caminho)
+    resultado, _, _ = github_api_request(caminho)
     if not resultado or "content" not in resultado:
         return None
     conteudo = base64.b64decode(resultado["content"]).decode("utf-8")
@@ -292,46 +313,73 @@ def diagnosticar_chat(driver, account_id):
 
 
 def enviar_mensagem(driver, account_id, mensagem, comando_id):
-    """Digite normalmente e envie ENTER, detalhando cada chamada Selenium."""
+    """Envia via teclado real; reduz consultas ao WebDriver sem mudar a ação."""
     if not mensagem or len(mensagem) > 100:
         raise ValueError("Mensagem vazia ou maior que 100 caracteres.")
 
     seletor = "input.chat-input[placeholder='Fale aqui...']"
+    inicio_total = time.monotonic()
     marcar_etapa(account_id, "FALAR: procurando campo de conversa...", status="💬 FALAR")
-    campo = WebDriverWait(driver, CHAT_FIELD_TIMEOUT).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, seletor))
+
+    # Antes: element_to_be_clickable fazia find_element + is_displayed +
+    # is_enabled a cada tentativa (até 3 requisições remotas). O campo do
+    # jogo já apareceu em testes reais; presence usa apenas find_element.
+    campo = WebDriverWait(driver, CHAT_FIELD_TIMEOUT, poll_frequency=0.4).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, seletor))
     )
-    marcar_etapa(account_id, "FALAR: campo de conversa localizado.", Fore.GREEN)
+    t_encontrado = time.monotonic()
+    marcar_etapa(
+        account_id,
+        f"FALAR: campo localizado em {t_encontrado - inicio_total:.1f}s.",
+        Fore.GREEN,
+    )
 
     marcar_etapa(account_id, "FALAR: clicando no campo...")
     campo.click()
-    marcar_etapa(account_id, "FALAR: campo clicado.", Fore.GREEN)
+    t_clique = time.monotonic()
 
     marcar_etapa(account_id, "FALAR: limpando o campo...")
     campo.clear()
-    marcar_etapa(account_id, "FALAR: digitando a mensagem...")
-    campo.send_keys(mensagem)
-    marcar_etapa(account_id, "FALAR: conferindo texto digitado...")
-    texto_digitado = campo.get_attribute("value")
-    if texto_digitado != mensagem:
-        raise RuntimeError(
-            f"Texto digitado diverge do esperado (esperado={len(mensagem)} "
-            f"caracteres; campo={len(texto_digitado or '')} caracteres)."
-        )
-    marcar_etapa(account_id, "FALAR: mensagem digitada e conferida.", Fore.GREEN)
+    t_limpeza = time.monotonic()
 
-    marcar_etapa(account_id, "FALAR: pressionando ENTER...")
+    marcar_etapa(account_id, "FALAR: digitando mensagem...")
+    campo.send_keys(mensagem)
+    t_digitacao = time.monotonic()
+
+    if CHAT_CONFIRMAR_TEXTO:
+        marcar_etapa(account_id, "FALAR: conferindo mensagem digitada...")
+        texto_digitado = campo.get_attribute("value")
+        if texto_digitado != mensagem:
+            raise RuntimeError(
+                f"Texto divergente (esperado={len(mensagem)}; "
+                f"campo={len(texto_digitado or '')})."
+            )
+
+    # O ENTER continua em um comando separado para saber se um eventual
+    # timeout ocorreu antes ou durante o envio (evita reenvio duplicado).
+    marcar_etapa(account_id, "FALAR: mensagem digitada; pressionando ENTER...")
     try:
         campo.send_keys(Keys.ENTER)
     except Exception as erro:
         raise EnterIndeterminado(
             f"Falha no ENTER do comando {comando_id}: {repr(erro)}"
         ) from erro
+    t_enter = time.monotonic()
+
     marcar_etapa(
         account_id,
         f"FALAR: ENTER pressionado para {comando_id}.",
         Fore.GREEN,
         status="✅ Online",
+    )
+    log(
+        f"[Conta {account_id}] FALAR: tempos → buscar={t_encontrado-inicio_total:.1f}s; "
+        f"clicar={t_clique-t_encontrado:.1f}s; "
+        f"limpar={t_limpeza-t_clique:.1f}s; "
+        f"digitar={t_digitacao-t_limpeza:.1f}s; "
+        f"ENTER={t_enter-t_digitacao:.1f}s; "
+        f"total={t_enter-inicio_total:.1f}s.",
+        Fore.CYAN,
     )
 
 
@@ -420,9 +468,15 @@ def monitorar_comandos(account_ids):
         return
 
     conhecidos = set()
+    etag = None
     try:
-        conhecidos = {item["name"] for item in listar_arquivos_comandos()}
-        log(f"Monitor de comandos iniciado para as contas {account_ids}.", Fore.CYAN)
+        arquivos_iniciais, etag, _ = listar_arquivos_comandos()
+        conhecidos = {item["name"] for item in arquivos_iniciais}
+        log(
+            f"Monitor de comandos iniciado para contas {account_ids} "
+            f"(consulta a cada {COMMAND_POLL_INTERVAL}s; cache ETag ativo).",
+            Fore.CYAN,
+        )
     except Exception as erro:
         log(f"Não foi possível consultar a fila inicialmente: {repr(erro)}", Fore.YELLOW)
 
@@ -431,7 +485,9 @@ def monitorar_comandos(account_ids):
 
     while True:
         try:
-            arquivos = listar_arquivos_comandos()
+            arquivos, etag_atual, nao_modificado = listar_arquivos_comandos(etag)
+            if not nao_modificado:
+                etag = etag_atual
 
             # Lê apenas arquivos novos desde o início deste processo.
             for arquivo in arquivos:
@@ -548,6 +604,21 @@ def monitorar_comandos(account_ids):
                     )
                     pendentes.pop(comando_id, None)
 
+        except urllib.error.HTTPError as erro:
+            if erro.code in (403, 429):
+                retry_after = erro.headers.get("Retry-After", "")
+                try:
+                    pausa = max(60, int(retry_after))
+                except (ValueError, TypeError):
+                    pausa = 60
+                log(
+                    f"GitHub retornou HTTP {erro.code}; pausando consulta "
+                    f"por {pausa}s para respeitar limite de API.",
+                    Fore.YELLOW,
+                )
+                time.sleep(pausa)
+            else:
+                log(f"Erro HTTP no monitor de comandos: {repr(erro)}", Fore.RED)
         except Exception as erro:
             log(f"Erro no monitor de comandos: {repr(erro)}", Fore.RED)
 
@@ -557,31 +628,30 @@ def monitorar_comandos(account_ids):
 # ---------- Sessão individual de cada conta ----------
 def verificar_sessao(driver, index, cliente_ausente_desde):
     """
-    Verificação curta: não fica 90s num WebDriverWait enquanto há fala na fila.
-    Retorna (continuar_sessao, momento_em_que_UI_sumiu).
+    Uma chamada ao ChromeDriver consulta URL e estado da UI em conjunto.
+    Retorna (continuar_sessao, quando_a_UI_sumiu).
     """
-    marcar_etapa(index, "Sessão: consultando URL...", registrar=DEBUG_SESSAO)
-    url_atual = driver.current_url
-    marcar_etapa(index, "Sessão: consultando interface principal...", registrar=DEBUG_SESSAO)
+    marcar_etapa(index, "Sessão: consultando URL e interface...", registrar=DEBUG_SESSAO)
+    estado = driver.execute_script("""
+        return {
+            url: window.location.href,
+            quartos: !!document.querySelector('.cursor-pointer.navigation-item.icon.icon-rooms'),
+            chat: !!document.querySelector('input.chat-input')
+        };
+    """)
+    url_atual = str(estado.get("url") or "")
+    tem_interface = bool(estado.get("quartos") or estado.get("chat"))
 
-    try:
-        driver.find_element(
-            By.CSS_SELECTOR,
-            ".cursor-pointer.navigation-item.icon.icon-rooms",
-        )
-    except NoSuchElementException:
+    if not tem_interface:
         if url_atual.rstrip("/") != URL_BIGCLIENT.rstrip("/"):
-            log(
-                f"[Conta {index}] ⚠️ Saiu do Big Client ({url_atual}). Relogando...",
-                Fore.YELLOW,
-            )
+            log(f"[Conta {index}] ⚠️ Saiu do Big Client ({url_atual}). Relogando...", Fore.YELLOW)
             return False, cliente_ausente_desde
 
         if cliente_ausente_desde is None:
             cliente_ausente_desde = time.monotonic()
             log(
                 f"[Conta {index}] ⚠️ Interface principal não localizada; "
-                "monitoramento continuará sem bloquear o FALAR.",
+                "o FALAR continuará com prioridade.",
                 Fore.YELLOW,
             )
         tempo_ausente = time.monotonic() - cliente_ausente_desde
@@ -589,14 +659,12 @@ def verificar_sessao(driver, index, cliente_ausente_desde):
                      Fore.YELLOW, status="🔄 Cliente carregando", registrar=False)
         if tempo_ausente >= 90:
             log(
-                f"[Conta {index}] ❌ Interface indisponível por "
-                f"{tempo_ausente:.0f}s. Relogando...",
+                f"[Conta {index}] ❌ Interface indisponível por {tempo_ausente:.0f}s. Relogando...",
                 Fore.RED,
             )
             return False, cliente_ausente_desde
         return True, cliente_ausente_desde
 
-    # O navegador respondeu e o ícone de quartos está presente.
     if cliente_ausente_desde is not None:
         log(f"[Conta {index}] ✅ Interface do cliente recarregada.", Fore.GREEN)
         if EXECUTAR_ACOES:
@@ -608,7 +676,9 @@ def verificar_sessao(driver, index, cliente_ausente_desde):
 
 
 def iniciar_sessao(username, password, index):
-    time.sleep(index * 3)  # mantém o espaçamento já utilizado entre logins
+    # Escalona 5 contas por grupo; evita que contas 46–50 aguardem mais de
+    # dois minutos só por usarem IDs absolutos altos.
+    time.sleep(((index - 1) % 5) * 3)
 
     while True:
         driver = None
@@ -679,7 +749,7 @@ def iniciar_sessao(username, password, index):
                 )
 
             # Um ChromeDriver só é acessado por esta thread.
-            # Verificações de sessão acontecem a cada CHECK_INTERVAL;
+            # Verificações de sessão usam uma única consulta a cada CHECK_INTERVAL;
             # enquanto isso, a fila FALAR é consultada a cada segundo.
             proxima_verificacao = time.monotonic() + CHECK_INTERVAL
             cliente_ausente_desde = None
@@ -688,7 +758,10 @@ def iniciar_sessao(username, password, index):
                 # PRIORIDADE: registra a tentativa ANTES de qualquer checagem periódica.
                 processar_comando_da_fila(driver, index)
 
-                if time.monotonic() >= proxima_verificacao:
+                # Não iniciar verificação de sessão com ações esperando na fila.
+                fila_pessoal = filas_comandos.get(index)
+                if (time.monotonic() >= proxima_verificacao
+                        and (fila_pessoal is None or fila_pessoal.empty())):
                     continuar, cliente_ausente_desde = verificar_sessao(
                         driver, index, cliente_ausente_desde,
                     )

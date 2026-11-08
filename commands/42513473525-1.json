@@ -1,0 +1,14 @@
+{
+  "id": "42513473525-1",
+  "action": "visit_room",
+  "room_owner": "Sandy",
+  "room_name": "cyndi lauper",
+  "targets": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "created_at": "2026-11-08T19:08:05.480Z"
+}

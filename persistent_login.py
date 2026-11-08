@@ -1,9 +1,14 @@
 import os
 import time
 import threading
-from datetime import datetime
+import json
+import base64
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
@@ -14,6 +19,9 @@ from colorama import Fore, Style, init
 # ===== CONFIGURAÇÃO =====
 URL_BIGCLIENT = "https://habblive.in/bigclient/"
 CHECK_INTERVAL = 15  # segundos entre verificações
+COMMAND_POLL_INTERVAL = int(os.getenv("COMMAND_POLL_INTERVAL", "20"))
+COMMANDS_PATH = "commands"
+COMMAND_MAX_AGE_SECONDS = 600  # comandos com mais de 10 minutos são ignorados
 EXECUTAR_ACOES = False  # True = faz ações no quarto, False = só loga/reloga
 
 # Configurações personalizadas
@@ -25,18 +33,24 @@ init(autoreset=True)
 
 status_contas = {}
 lock = threading.Lock()
+drivers_ativos = {}  # Selenium ativo por número absoluto da conta
+
+GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
+GITHUB_TOKEN = os.getenv("COMMAND_GITHUB_TOKEN", "")
+GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "main")
+
 
 def log(msg, color=Fore.WHITE):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{color}[{timestamp}] {msg}{Style.RESET_ALL}")
 
-def painel_status(total_contas):
+def painel_status(account_ids):
     while True:
         with lock:
             status_parts = []
-            for i in range(1, total_contas + 1):
-                estado = status_contas.get(i, "⏳ Iniciando")
-                status_parts.append(f"[Conta {i}] {estado}")
+            for account_id in account_ids:
+                estado = status_contas.get(account_id, "⏳ Iniciando")
+                status_parts.append(f"[Conta {account_id}] {estado}")
             painel = " | ".join(status_parts)
         log(painel, Fore.BLUE)
         time.sleep(5)
@@ -180,6 +194,154 @@ def executar_acoes_no_quarto(driver, index):
             else:
                 log(f"[Conta {index}] Sequência falhou após 3 tentativas. Vai seguir monitorando.", Fore.RED)
 
+# ---------- Recebimento e execução de comandos remotos ----------
+def github_api_request(path):
+    """Consulta a API de conteúdo do repositório onde a fila de comandos é gravada."""
+    if not GITHUB_REPOSITORY or not GITHUB_TOKEN:
+        raise RuntimeError("GITHUB_REPOSITORY ou COMMAND_GITHUB_TOKEN não configurado.")
+
+    url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/{path}?ref={GITHUB_REF_NAME}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "Habblive-Persistent-Login",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+
+
+def listar_arquivos_comandos():
+    resultado = github_api_request(COMMANDS_PATH)
+    if resultado is None:
+        return []
+    if not isinstance(resultado, list):
+        return []
+    return [item for item in resultado if item.get("type") == "file" and item.get("name", "").endswith(".json")]
+
+
+def obter_comando(caminho):
+    resultado = github_api_request(caminho)
+    if not resultado or "content" not in resultado:
+        return None
+    conteudo = base64.b64decode(resultado["content"]).decode("utf-8")
+    return json.loads(conteudo)
+
+
+def enviar_mensagem(driver, account_id, mensagem):
+    """Digita a mensagem no chat e envia com ENTER."""
+    if not mensagem or len(mensagem) > 100:
+        raise ValueError("A mensagem está vazia ou ultrapassa 100 caracteres.")
+
+    campo = WebDriverWait(driver, 25).until(
+        EC.element_to_be_clickable((By.CSS_SELECTOR, "input.chat-input[placeholder='Fale aqui...']"))
+    )
+    campo.click()
+    campo.clear()
+    campo.send_keys(mensagem)
+    campo.send_keys(Keys.ENTER)
+    log(f"[Conta {account_id}] Mensagem enviada: {mensagem}", Fore.GREEN)
+
+
+def monitorar_comandos(account_ids):
+    """Busca novos arquivos de comando e os executa uma vez por conta selecionada."""
+    if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
+        log("Leitor de comandos desativado: configure COMMAND_GITHUB_TOKEN e GITHUB_REPOSITORY.", Fore.YELLOW)
+        return
+
+    # Ignora comandos antigos que já estavam na fila antes deste processo iniciar.
+    conhecidos = set()
+    try:
+        conhecidos = {item["name"] for item in listar_arquivos_comandos()}
+        log(f"Monitor de comandos iniciado para as contas {account_ids}.", Fore.CYAN)
+    except Exception as erro:
+        log(f"Não foi possível consultar a fila inicialmente: {repr(erro)}", Fore.YELLOW)
+
+    pendentes = {}
+    account_ids_set = set(account_ids)
+
+    while True:
+        try:
+            arquivos = listar_arquivos_comandos()
+            for arquivo in arquivos:
+                nome = arquivo.get("name", "")
+                if nome in conhecidos:
+                    continue
+
+                caminho = arquivo.get("path")
+                try:
+                    comando = obter_comando(caminho)
+                    if not comando:
+                        continue
+                    conhecidos.add(nome)
+
+                    if comando.get("action") != "say":
+                        continue
+
+                    mensagem = str(comando.get("message", ""))
+                    alvos = set(int(item) for item in comando.get("targets", []))
+                    alvos_locais = alvos.intersection(account_ids_set)
+                    if not mensagem or len(mensagem) > 100 or not alvos_locais:
+                        continue
+
+                    criado_em = datetime.fromisoformat(
+                        comando.get("created_at", "").replace("Z", "+00:00")
+                    )
+                    if criado_em.tzinfo is None:
+                        criado_em = criado_em.replace(tzinfo=timezone.utc)
+                    idade = (datetime.now(timezone.utc) - criado_em).total_seconds()
+                    if idade > COMMAND_MAX_AGE_SECONDS:
+                        log(f"Comando antigo ignorado: {nome}.", Fore.YELLOW)
+                        continue
+
+                    comando_id = str(comando.get("id", nome))
+                    pendentes[comando_id] = {
+                        "message": mensagem,
+                        "targets": alvos_locais,
+                        "sent": set(),
+                        "created_at": criado_em,
+                    }
+                    log(f"Novo comando FALAR recebido ({comando_id}) para contas {sorted(alvos_locais)}.", Fore.CYAN)
+                except Exception as erro:
+                    log(f"Falha ao ler o comando {nome}: {repr(erro)}", Fore.YELLOW)
+
+            agora = datetime.now(timezone.utc)
+            for comando_id, item in list(pendentes.items()):
+                idade = (agora - item["created_at"]).total_seconds()
+                if idade > COMMAND_MAX_AGE_SECONDS:
+                    log(f"Comando {comando_id} expirou antes de todas as contas executarem.", Fore.YELLOW)
+                    pendentes.pop(comando_id, None)
+                    continue
+
+                for account_id in sorted(item["targets"] - item["sent"]):
+                    with lock:
+                        driver = drivers_ativos.get(account_id)
+                    if driver is None:
+                        continue
+                    try:
+                        enviar_mensagem(driver, account_id, item["message"])
+                        item["sent"].add(account_id)
+                    except Exception as erro:
+                        log(f"[Conta {account_id}] Não foi possível enviar agora; tentará novamente: {repr(erro)}", Fore.YELLOW)
+
+                if item["targets"].issubset(item["sent"]):
+                    log(f"Comando {comando_id} concluído para todas as contas deste grupo.", Fore.GREEN)
+                    pendentes.pop(comando_id, None)
+
+        except Exception as erro:
+            log(f"Erro no monitor de comandos: {repr(erro)}", Fore.RED)
+
+        time.sleep(COMMAND_POLL_INTERVAL)
+
+
 def iniciar_sessao(username, password, index):
     time.sleep(index * 3)  # evita colisão de logins
 
@@ -232,6 +394,7 @@ def iniciar_sessao(username, password, index):
 
             with lock:
                 status_contas[index] = "✅ Online"
+                drivers_ativos[index] = driver
 
             # Ações pós-login
             if EXECUTAR_ACOES:
@@ -250,6 +413,9 @@ def iniciar_sessao(username, password, index):
                     except:
                         # Elemento não encontrado → cliente realmente saiu
                         log(f"[Conta {index}] ⚠️ Redirecionado para fora ({current_url}). Relogando...", Fore.YELLOW)
+                        with lock:
+                            if drivers_ativos.get(index) is driver:
+                                drivers_ativos.pop(index, None)
                         driver.quit()
                         time.sleep(2)
                         break
@@ -293,35 +459,53 @@ def iniciar_sessao(username, password, index):
             log(f"[Conta {index}] ❌ Erro: {repr(e)}", Fore.RED)
             with lock:
                 status_contas[index] = "❌ Erro"
-            driver.quit()
+                if drivers_ativos.get(index) is driver:
+                    drivers_ativos.pop(index, None)
+            try:
+                driver.quit()
+            except Exception:
+                pass
             time.sleep(5)
 
-# Lê todas as contas, mesmo com buracos
+# Lê as contas absolutas definidas pelo workflow (ex.: 21,22,23,24,25).
+# Se ACCOUNT_IDS não for informado, mantém compatibilidade com a leitura antiga.
+account_ids_env = os.getenv("ACCOUNT_IDS", "").strip()
+if account_ids_env:
+    account_ids = [int(item.strip()) for item in account_ids_env.split(",") if item.strip()]
+else:
+    account_ids = list(range(1, 101))
+
 accounts = []
-i = 1
-while i <= 100:
-    user = os.getenv(f"HABBLIVE_USERNAME_{i}")
-    pwd = os.getenv(f"HABBLIVE_PASSWORD_{i}")
+for account_id in account_ids:
+    user = os.getenv(f"HABBLIVE_USERNAME_{account_id}")
+    pwd = os.getenv(f"HABBLIVE_PASSWORD_{account_id}")
     if user and pwd:
-        accounts.append((user, pwd))
-    i += 1
+        accounts.append((account_id, user, pwd))
 
 if not accounts:
-    raise ValueError("Nenhuma conta configurada nos secrets.")
+    raise ValueError("Nenhuma conta configurada nos secrets para os ACCOUNT_IDS informados.")
 
-# Inicializa status
+account_ids_ativos = [item[0] for item in accounts]
+
+# Inicializa status com os números absolutos das contas.
 with lock:
-    for idx in range(1, len(accounts) + 1):
-        status_contas[idx] = "⏳ Iniciando"
+    for account_id in account_ids_ativos:
+        status_contas[account_id] = "⏳ Iniciando"
 
 # Thread do painel
-painel_thread = threading.Thread(target=painel_status, args=(len(accounts),))
+painel_thread = threading.Thread(target=painel_status, args=(account_ids_ativos,), daemon=True)
 painel_thread.start()
+
+# Thread que recebe comandos sem interromper os navegadores de login.
+command_thread = threading.Thread(
+    target=monitorar_comandos, args=(account_ids_ativos,), daemon=True
+)
+command_thread.start()
 
 # Threads das contas
 threads = []
-for idx, (username, password) in enumerate(accounts, start=1):
-    t = threading.Thread(target=iniciar_sessao, args=(username, password, idx))
+for account_id, username, password in accounts:
+    t = threading.Thread(target=iniciar_sessao, args=(username, password, account_id))
     t.start()
     threads.append(t)
 

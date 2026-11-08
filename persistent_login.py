@@ -10,7 +10,10 @@ from urllib.parse import quote
 from datetime import datetime, timezone
 
 from selenium import webdriver
-from selenium.common.exceptions import NoSuchElementException, TimeoutException
+from selenium.common.exceptions import (
+    NoSuchElementException, TimeoutException,
+    ElementClickInterceptedException, ElementNotInteractableException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
@@ -31,6 +34,8 @@ COMMAND_MAX_AGE_SECONDS = 600  # comandos com mais de 10 minutos são ignorados
 COMMAND_MAX_ATTEMPTS = 5
 COMMAND_RETRY_DELAY_SECONDS = max(1, int(os.getenv("COMMAND_RETRY_DELAY_SECONDS", "15")))
 CHAT_FIELD_TIMEOUT = max(3, int(os.getenv("CHAT_FIELD_TIMEOUT", "8")))
+CAFOFO_MENU_TIMEOUT = max(3, int(os.getenv("CAFOFO_MENU_TIMEOUT", "12")))
+CAFOFO_HOUSE_TIMEOUT = max(3, int(os.getenv("CAFOFO_HOUSE_TIMEOUT", "15")))
 # A leitura do valor digitado acrescenta uma chamada ao Selenium; desligada
 # para priorizar velocidade, mas pode ser reativada se houver inconsistências.
 CHAT_CONFIRMAR_TEXTO = os.getenv("CHAT_CONFIRMAR_TEXTO", "0").lower() in ("1", "true", "yes")
@@ -87,7 +92,7 @@ def painel_status(account_ids):
                 # Um navegador ocioso/Online não está travado só porque passou
                 # algum tempo sem uma operação Selenium. Alertar apenas quando
                 # houver uma operação efetivamente em andamento.
-                operacao_ativa = (estado == "💬 FALAR" or etapa.startswith(
+                operacao_ativa = (estado in ("💬 FALAR", "🏠 CAFOFO") or etapa.startswith(
                     ("Sessão: consultando", "Criando ChromeDriver", "Abrindo", "Preenchendo")))
                 if ultima is not None and operacao_ativa:
                     sem_progresso = int(agora - ultima)
@@ -383,79 +388,180 @@ def enviar_mensagem(driver, account_id, mensagem, comando_id):
     )
 
 
+# ---------- Ação: IR AO CAFOFO ----------
+CASA_CSS = ".cursor-pointer.navigation-item.icon.icon-house"
+HABBO_CSS = ".cursor-pointer.navigation-item.icon.icon-habbo"
+
+
+class CliqueIndeterminado(Exception):
+    """O clique pode ter acontecido antes de um erro no ChromeDriver."""
+
+
+def localizar_icone_visivel(driver, seletor):
+    """Usa somente os ícones visíveis e habilitados na página atual."""
+    for elemento in driver.find_elements(By.CSS_SELECTOR, seletor):
+        if elemento.is_displayed() and elemento.is_enabled():
+            return elemento
+    return None
+
+
+def clicar_icone_com_seguranca(driver, elemento, descricao):
+    """Prefere clique nativo. Recorre a JS só quando houve interceptação."""
+    try:
+        elemento.click()
+        return "Selenium"
+    except (ElementClickInterceptedException, ElementNotInteractableException):
+        # Nessas duas situações o Selenium informa que o clique não ocorreu.
+        try:
+            driver.execute_script("arguments[0].click();", elemento)
+            return "JavaScript (clique nativo impedido)"
+        except Exception as erro:
+            raise CliqueIndeterminado(
+                f"Resultado incerto ao clicar em {descricao}: {type(erro).__name__}: {erro}"
+            ) from erro
+    except Exception as erro:
+        raise CliqueIndeterminado(
+            f"Resultado incerto ao clicar em {descricao}: {type(erro).__name__}: {erro}"
+        ) from erro
+
+
+def ir_ao_cafofo(driver, account_id, comando_id):
+    """Casa direta; se ausente, abre o menu Habbo e clica na casa exibida."""
+    inicio = time.monotonic()
+    marcar_etapa(account_id, "CAFOFO: procurando ícone da casa...", status="🏠 CAFOFO")
+
+    # Regra principal: se a casa já está disponível, não abrir o menu Habbo.
+    casa = localizar_icone_visivel(driver, CASA_CSS)
+    if casa is not None:
+        marcar_etapa(account_id, "CAFOFO: casa encontrada; clicando...")
+        metodo = clicar_icone_com_seguranca(driver, casa, "ícone da casa")
+        log(
+            f"[Conta {account_id}] 🏠 CAFOFO {comando_id}: ícone da casa clicado "
+            f"diretamente ({metodo}; {time.monotonic()-inicio:.1f}s).",
+            Fore.GREEN,
+        )
+        marcar_etapa(account_id, "CAFOFO: clique direto realizado.", Fore.GREEN,
+                     status="✅ Online", registrar=False)
+        return
+
+    # Plano B: a casa não aparece neste momento; abra o menu Habbo.
+    marcar_etapa(account_id, "CAFOFO: casa ausente; procurando menu Habbo...")
+    habbo = WebDriverWait(driver, CAFOFO_MENU_TIMEOUT, poll_frequency=0.6).until(
+        lambda d: localizar_icone_visivel(d, HABBO_CSS)
+    )
+
+    marcar_etapa(account_id, "CAFOFO: abrindo menu Habbo...")
+    metodo_menu = clicar_icone_com_seguranca(driver, habbo, "menu Habbo")
+    log(f"[Conta {account_id}] CAFOFO: menu Habbo aberto ({metodo_menu}).", Fore.CYAN)
+
+    # O menu pode animar; aguarda o ícone aparecer e ficar interativo.
+    marcar_etapa(account_id, "CAFOFO: aguardando ícone central da casa...")
+    casa = WebDriverWait(driver, CAFOFO_HOUSE_TIMEOUT, poll_frequency=0.6).until(
+        lambda d: localizar_icone_visivel(d, CASA_CSS)
+    )
+
+    marcar_etapa(account_id, "CAFOFO: clicando na casa após abrir Habbo...")
+    metodo_casa = clicar_icone_com_seguranca(driver, casa, "casa após menu Habbo")
+    log(
+        f"[Conta {account_id}] 🏠 CAFOFO {comando_id}: menu Habbo → casa "
+        f"({metodo_casa}; {time.monotonic()-inicio:.1f}s).",
+        Fore.GREEN,
+    )
+    marcar_etapa(account_id, "CAFOFO: clique após menu realizado.", Fore.GREEN,
+                 status="✅ Online", registrar=False)
+
+
 def processar_comando_da_fila(driver, account_id):
-    """Retira no máximo uma ação da fila; Selenium fica na thread da conta."""
+    """Executa uma ação da fila na thread proprietária do ChromeDriver."""
     fila = filas_comandos.get(account_id)
     if fila is None:
         return
 
     try:
-        comando_id, mensagem, criado_timestamp, tentativas, executar_apos = fila.get_nowait()
+        comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos = fila.get_nowait()
     except queue.Empty:
         return
 
     agora = time.time()
     if agora < executar_apos:
-        fila.put((comando_id, mensagem, criado_timestamp, tentativas, executar_apos))
+        fila.put((comando_id, acao, mensagem, criado_timestamp, tentativas, executar_apos))
         return
 
+    nome_acao = "FALAR" if acao == "say" else "CAFOFO"
+    status_acao = "💬 FALAR" if acao == "say" else "🏠 CAFOFO"
     if agora - criado_timestamp > COMMAND_MAX_AGE_SECONDS:
-        log(f"[Conta {account_id}] FALAR {comando_id} expirou antes da execução.", Fore.YELLOW)
+        log(f"[Conta {account_id}] {nome_acao} {comando_id} expirou.", Fore.YELLOW)
         return
 
     tentativa_atual = tentativas + 1
     marcar_etapa(
         account_id,
-        f"FALAR: iniciando comando {comando_id}, tentativa "
+        f"{nome_acao}: iniciando comando {comando_id}, tentativa "
         f"{tentativa_atual}/{COMMAND_MAX_ATTEMPTS}.",
-        status="💬 FALAR",
+        status=status_acao,
     )
 
     try:
-        enviar_mensagem(driver, account_id, mensagem, comando_id)
+        if acao == "say":
+            enviar_mensagem(driver, account_id, mensagem, comando_id)
+        elif acao == "go_home":
+            ir_ao_cafofo(driver, account_id, comando_id)
+        else:
+            raise ValueError(f"Ação desconhecida na fila: {acao!r}")
+
         with lock:
             comandos_concluidos.setdefault(comando_id, set()).add(account_id)
-        log(
-            f"[Conta {account_id}] ✅ Comando {comando_id}: ENTER enviado "
-            "(recebimento pelo servidor ainda não confirmado).",
-            Fore.GREEN,
-        )
 
-    except EnterIndeterminado as erro:
-        # Se ocorreu um timeout DURANTE o ENTER, ele talvez tenha sido recebido.
-        # Não tentamos novamente automaticamente para evitar fala duplicada.
-        marcar_etapa(account_id, "FALAR: resultado do ENTER indeterminado.", Fore.RED,
-                     status="⚠️ ENTER incerto")
-        log(f"[Conta {account_id}] {repr(erro)}. Não haverá reenvio automático.", Fore.RED)
+        if acao == "say":
+            log(
+                f"[Conta {account_id}] ✅ FALAR {comando_id}: ENTER enviado "
+                "(recebimento pelo servidor não confirmado).",
+                Fore.GREEN,
+            )
+        else:
+            log(
+                f"[Conta {account_id}] ✅ CAFOFO {comando_id}: clique realizado "
+                "(navegação final não confirmada).",
+                Fore.GREEN,
+            )
+
+    except (EnterIndeterminado, CliqueIndeterminado) as erro:
+        # Não repetir ações que podem já ter acontecido (ENTER ou clique).
+        marcar_etapa(
+            account_id, f"{nome_acao}: resultado da ação indeterminado.",
+            Fore.RED, status="⚠️ Ação incerta",
+        )
+        log(f"[Conta {account_id}] {repr(erro)}. Sem repetição automática.", Fore.RED)
 
     except Exception as erro:
         log(
-            f"[Conta {account_id}] FALAR {comando_id} falhou na tentativa "
+            f"[Conta {account_id}] {nome_acao} {comando_id} falhou na tentativa "
             f"{tentativa_atual}: {type(erro).__name__}: {str(erro)[:450]!r}",
             Fore.YELLOW,
         )
-        if isinstance(erro, TimeoutException):
+        if acao == "say" and isinstance(erro, TimeoutException):
             diagnosticar_chat(driver, account_id)
 
         idade = time.time() - criado_timestamp
         if tentativa_atual < COMMAND_MAX_ATTEMPTS and idade < COMMAND_MAX_AGE_SECONDS:
-            proxima_tentativa = time.time() + COMMAND_RETRY_DELAY_SECONDS
-            fila.put((comando_id, mensagem, criado_timestamp,
-                      tentativa_atual, proxima_tentativa))
+            proxima = time.time() + COMMAND_RETRY_DELAY_SECONDS
+            fila.put((comando_id, acao, mensagem, criado_timestamp,
+                      tentativa_atual, proxima))
             log(
-                f"[Conta {account_id}] FALAR {comando_id} reagendado "
-                f"para daqui a {COMMAND_RETRY_DELAY_SECONDS}s "
-                f"(tentativa seguinte {tentativa_atual + 1}/{COMMAND_MAX_ATTEMPTS}).",
+                f"[Conta {account_id}] {nome_acao} {comando_id}: nova tentativa "
+                f"daqui a {COMMAND_RETRY_DELAY_SECONDS}s ",
                 Fore.YELLOW,
             )
         else:
             log(
-                f"[Conta {account_id}] ❌ FALAR {comando_id} sem sucesso "
-                f"após {tentativa_atual} tentativa(s); não será reenviado.",
+                f"[Conta {account_id}] ❌ {nome_acao} {comando_id}: "
+                "tentativas esgotadas ou comando expirado.",
                 Fore.RED,
             )
-        marcar_etapa(account_id, "FALAR: tentativa encerrada.", Fore.YELLOW,
-                     status="✅ Online", registrar=False)
+        marcar_etapa(
+            account_id, f"{nome_acao}: tentativa encerrada.",
+            Fore.YELLOW, status="✅ Online", registrar=False,
+        )
 
 
 def monitorar_comandos(account_ids):
@@ -504,14 +610,17 @@ def monitorar_comandos(account_ids):
                     # Marca como conhecido depois de conseguir ler o JSON.
                     conhecidos.add(nome)
 
-                    if comando.get("action") != "say":
+                    acao = str(comando.get("action", ""))
+                    if acao not in ("say", "go_home"):
                         continue
 
-                    mensagem = str(comando.get("message", ""))
+                    mensagem = str(comando.get("message", "")) if acao == "say" else ""
                     alvos = set(int(item) for item in comando.get("targets", []))
                     alvos_locais = alvos.intersection(account_ids_set)
 
-                    if not mensagem or len(mensagem) > 100 or not alvos_locais:
+                    if not alvos_locais:
+                        continue
+                    if acao == "say" and (not mensagem or len(mensagem) > 100):
                         continue
 
                     data_criacao = comando.get("created_at")
@@ -540,6 +649,7 @@ def monitorar_comandos(account_ids):
                         continue
 
                     pendentes[comando_id] = {
+                        "action": acao,
                         "message": mensagem,
                         "targets": alvos_locais,
                         "dispatched": set(),
@@ -549,8 +659,8 @@ def monitorar_comandos(account_ids):
                         comandos_concluidos.setdefault(comando_id, set())
 
                     log(
-                        f"Novo comando FALAR recebido ({comando_id}) "
-                        f"para contas {sorted(alvos_locais)}.",
+                        f"Novo comando {'FALAR' if acao == 'say' else 'CAFOFO'} recebido "
+                        f"({comando_id}) para contas {sorted(alvos_locais)}.",
                         Fore.CYAN
                     )
 
@@ -583,6 +693,7 @@ def monitorar_comandos(account_ids):
 
                     fila.put((
                         comando_id,
+                        item["action"],
                         item["message"],
                         item["created_at"].timestamp(),
                         0,
@@ -651,7 +762,7 @@ def verificar_sessao(driver, index, cliente_ausente_desde):
             cliente_ausente_desde = time.monotonic()
             log(
                 f"[Conta {index}] ⚠️ Interface principal não localizada; "
-                "o FALAR continuará com prioridade.",
+                "os comandos continuarão com prioridade.",
                 Fore.YELLOW,
             )
         tempo_ausente = time.monotonic() - cliente_ausente_desde
@@ -750,7 +861,7 @@ def iniciar_sessao(username, password, index):
 
             # Um ChromeDriver só é acessado por esta thread.
             # Verificações de sessão usam uma única consulta a cada CHECK_INTERVAL;
-            # enquanto isso, a fila FALAR é consultada a cada segundo.
+            # enquanto isso, as filas de comandos são consultadas a cada segundo.
             proxima_verificacao = time.monotonic() + CHECK_INTERVAL
             cliente_ausente_desde = None
 

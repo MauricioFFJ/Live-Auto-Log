@@ -1,4 +1,4 @@
-name: RESPEITAR
+name: (Comando) Respeitar
 
 on:
   workflow_dispatch:

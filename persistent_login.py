@@ -3,9 +3,11 @@ import time
 import threading
 import json
 import base64
+import queue
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
+
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -18,31 +20,35 @@ from colorama import Fore, Style, init
 
 # ===== CONFIGURAÇÃO =====
 URL_BIGCLIENT = "https://habblive.in/bigclient/"
-CHECK_INTERVAL = 15  # segundos entre verificações
+CHECK_INTERVAL = 15  # segundos entre verificações da sessão
 COMMAND_POLL_INTERVAL = int(os.getenv("COMMAND_POLL_INTERVAL", "20"))
 COMMANDS_PATH = "commands"
 COMMAND_MAX_AGE_SECONDS = 600  # comandos com mais de 10 minutos são ignorados
+COMMAND_MAX_ATTEMPTS = 5
 EXECUTAR_ACOES = False  # True = faz ações no quarto, False = só loga/reloga
 
 # Configurações personalizadas
-DONO_QUARTO = "Mist"         # Nome do dono a ser digitado no filtro
-NOME_QUARTO = "Picnic - Encontre seu 🎁"   # Nome exato (ou parte) do quarto a ser clicado
+DONO_QUARTO = "Mist"
+NOME_QUARTO = "Picnic - Encontre seu 🎁"
 # ========================
 
 init(autoreset=True)
 
 status_contas = {}
 lock = threading.Lock()
-drivers_ativos = {}  # Selenium ativo por número absoluto da conta
+drivers_ativos = {}  # Mantido para status/compatibilidade; o monitor não usa Selenium.
+filas_comandos = {}  # Uma fila independente por conta.
+comandos_concluidos = {}  # IDs concluídos por conta.
 
 GITHUB_REPOSITORY = os.getenv("GITHUB_REPOSITORY", "")
-GITHUB_TOKEN = os.getenv("COMMAND_GITHUB_TOKEN", "")
+GITHUB_TOKEN = os.getenv("COMMAND_GITHUB_TOKEN", "") or os.getenv("GITHUB_TOKEN", "")
 GITHUB_REF_NAME = os.getenv("GITHUB_REF_NAME", "main")
 
 
 def log(msg, color=Fore.WHITE):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{color}[{timestamp}] {msg}{Style.RESET_ALL}")
+    print(f"{color}[{timestamp}] {msg}{Style.RESET_ALL}", flush=True)
+
 
 def painel_status(account_ids):
     while True:
@@ -54,6 +60,7 @@ def painel_status(account_ids):
             painel = " | ".join(status_parts)
         log(painel, Fore.BLUE)
         time.sleep(5)
+
 
 # ---------- Helpers robustos ----------
 def wait_click_css(driver, css, desc, timeout=30, use_js=False):
@@ -71,6 +78,7 @@ def wait_click_css(driver, css, desc, timeout=30, use_js=False):
     log(f"{desc} clicado.", Fore.GREEN)
     return elem
 
+
 def wait_click_xpath(driver, xpath, desc, timeout=40, use_js=False):
     wait = WebDriverWait(driver, timeout)
     elem = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
@@ -85,6 +93,7 @@ def wait_click_xpath(driver, xpath, desc, timeout=40, use_js=False):
             driver.execute_script("arguments[0].click();", elem)
     log(f"{desc} clicado.", Fore.GREEN)
     return elem
+
 
 def wait_type_css(driver, css, text, desc, timeout=30, clear_first=False, fire_input=True):
     wait = WebDriverWait(driver, timeout)
@@ -107,8 +116,8 @@ def wait_type_css(driver, css, text, desc, timeout=30, clear_first=False, fire_i
     log(f"{desc} digitado: '{text}'.", Fore.MAGENTA)
     return elem
 
+
 def selecionar_opcao_dono(driver):
-    # Usa mudança direta de value + evento change para garantir
     select_css = "select.form-select.form-select-sm"
     wait = WebDriverWait(driver, 30)
     select_elem = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, select_css)))
@@ -121,8 +130,8 @@ def selecionar_opcao_dono(driver):
     log("Filtro 'Dono' selecionado (via change event).", Fore.GREEN)
     return select_elem
 
+
 def clicar_quarto_por_nome(driver, nome, timeout=40):
-    # XPath que ignora maiúsculas/minúsculas (com acentos) e tenta exato; se não achar, tenta contains.
     mapa_maius = "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÂÊÎÔÛÃÕÇ"
     mapa_minus = "abcdefghijklmnopqrstuvwxyzáéíóúâêîôûãõç"
     nome_lower = nome.lower()
@@ -142,6 +151,7 @@ def clicar_quarto_por_nome(driver, nome, timeout=40):
         log(f"Quarto exato não encontrado: {repr(e1)}. Tentando por 'contém'...", Fore.YELLOW)
         return wait_click_xpath(driver, xpath_contains, f"Quarto contendo '{nome}'", timeout=timeout, use_js=True)
 
+
 # ---------- Sequência de ações com retentativas ----------
 def executar_acoes_no_quarto(driver, index):
     for tentativa in range(1, 4):
@@ -149,43 +159,35 @@ def executar_acoes_no_quarto(driver, index):
             log(f"[Conta {index}] Iniciando sequência (tentativa {tentativa}/3). Aguardando 15s...", Fore.YELLOW)
             time.sleep(15)
 
-            # Abrir navegador de quartos
             wait_click_css(driver, ".cursor-pointer.navigation-item.icon.icon-rooms",
                            "[Navegador de Quartos]", timeout=30, use_js=True)
             time.sleep(4)
 
-            # Abrir o select e selecionar 'Dono'
             wait_click_css(driver, "select.form-select.form-select-sm",
                            "[Menu de filtro]", timeout=30, use_js=True)
             time.sleep(4)
             selecionar_opcao_dono(driver)
             time.sleep(4)
 
-            # Campo de filtro e texto do dono
             wait_type_css(driver,
                           "input.form-control.form-control-sm[placeholder='filtrar quartos por']",
                           DONO_QUARTO, "[Filtro de texto - dono]", timeout=30,
                           clear_first=True, fire_input=True)
             time.sleep(4)
 
-            # Clicar no botão buscar
             wait_click_css(driver,
                            ".d-flex.align-items-center.justify-content-center.btn.btn-primary.btn-sm",
                            "[Botão Buscar]", timeout=30, use_js=True)
             time.sleep(15)
 
-            # Clicar no quarto pelo nome
             clicar_quarto_por_nome(driver, NOME_QUARTO, timeout=45)
             log(f"[Conta {index}] Entrando no quarto '{NOME_QUARTO}'.", Fore.GREEN)
-
-            # Sequência concluída
             return
 
         except Exception as e:
             log(f"[Conta {index}] Falha na sequência (tentativa {tentativa}/3): {repr(e)}", Fore.RED)
             if tentativa < 3:
                 time.sleep(6)
-                # Pequeno refresh no navegador de quartos para estabilizar a UI
                 try:
                     wait_click_css(driver, ".cursor-pointer.navigation-item.icon.icon-rooms",
                                    "[Reabrir Navegador de Quartos]", timeout=15, use_js=True)
@@ -194,11 +196,12 @@ def executar_acoes_no_quarto(driver, index):
             else:
                 log(f"[Conta {index}] Sequência falhou após 3 tentativas. Vai seguir monitorando.", Fore.RED)
 
-# ---------- Recebimento e execução de comandos remotos ----------
+
+# ---------- GitHub: recebimento e distribuição de comandos ----------
 def github_api_request(path):
-    """Consulta a API de conteúdo do repositório onde a fila de comandos é gravada."""
+    """Consulta a API de conteúdo do repositório onde a fila é gravada."""
     if not GITHUB_REPOSITORY or not GITHUB_TOKEN:
-        raise RuntimeError("GITHUB_REPOSITORY ou COMMAND_GITHUB_TOKEN não configurado.")
+        raise RuntimeError("GITHUB_REPOSITORY ou COMMAND_GITHUB_TOKEN/GITHUB_TOKEN não configurado.")
 
     url = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/contents/{path}?ref={GITHUB_REF_NAME}"
     request = urllib.request.Request(
@@ -221,11 +224,12 @@ def github_api_request(path):
 
 def listar_arquivos_comandos():
     resultado = github_api_request(COMMANDS_PATH)
-    if resultado is None:
+    if resultado is None or not isinstance(resultado, list):
         return []
-    if not isinstance(resultado, list):
-        return []
-    return [item for item in resultado if item.get("type") == "file" and item.get("name", "").endswith(".json")]
+    return [
+        item for item in resultado
+        if item.get("type") == "file" and item.get("name", "").endswith(".json")
+    ]
 
 
 def obter_comando(caminho):
@@ -236,28 +240,71 @@ def obter_comando(caminho):
     return json.loads(conteudo)
 
 
-def enviar_mensagem(driver, account_id, mensagem):
-    """Digita a mensagem no chat e envia com ENTER."""
-    if not mensagem or len(mensagem) > 100:
-        raise ValueError("A mensagem está vazia ou ultrapassa 100 caracteres.")
+def processar_comando_da_fila(driver, account_id):
+    """Executa no máximo um comando pendente na thread proprietária do navegador."""
+    fila = filas_comandos.get(account_id)
+    if fila is None:
+        return
 
-    campo = WebDriverWait(driver, 25).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, "input.chat-input[placeholder='Fale aqui...']"))
-    )
-    campo.click()
-    campo.clear()
-    campo.send_keys(mensagem)
-    campo.send_keys(Keys.ENTER)
-    log(f"[Conta {account_id}] Mensagem enviada: {mensagem}", Fore.GREEN)
+    try:
+        comando_id, mensagem, criado_timestamp, tentativa = fila.get_nowait()
+    except queue.Empty:
+        return
+
+    idade = time.time() - criado_timestamp
+    if idade > COMMAND_MAX_AGE_SECONDS:
+        log(f"[Conta {account_id}] Comando {comando_id} expirou antes da execução.", Fore.YELLOW)
+        return
+
+    tentativa += 1
+
+    try:
+        seletor = "input.chat-input[placeholder='Fale aqui...']"
+        campo = WebDriverWait(driver, 12).until(
+            EC.element_to_be_clickable((By.CSS_SELECTOR, seletor))
+        )
+
+        campo.click()
+        campo.clear()
+        campo.send_keys(mensagem)
+        campo.send_keys(Keys.ENTER)
+
+        with lock:
+            comandos_concluidos.setdefault(comando_id, set()).add(account_id)
+
+        log(
+            f"[Conta {account_id}] ENTER enviado para o comando {comando_id}: {mensagem}",
+            Fore.GREEN
+        )
+
+    except Exception as erro:
+        idade = time.time() - criado_timestamp
+        if tentativa < COMMAND_MAX_ATTEMPTS and idade <= COMMAND_MAX_AGE_SECONDS:
+            # A tentativa é recolocada no fim da fila; o navegador será acessado
+            # novamente apenas pela thread desta conta.
+            fila.put((comando_id, mensagem, criado_timestamp, tentativa))
+            log(
+                f"[Conta {account_id}] Falha ao executar {comando_id}. "
+                f"Nova tentativa {tentativa}/{COMMAND_MAX_ATTEMPTS}: {repr(erro)}",
+                Fore.YELLOW
+            )
+        else:
+            log(
+                f"[Conta {account_id}] Comando {comando_id} falhou após "
+                f"{tentativa} tentativas: {repr(erro)}",
+                Fore.RED
+            )
 
 
 def monitorar_comandos(account_ids):
-    """Busca novos arquivos de comando e os executa uma vez por conta selecionada."""
+    """Busca comandos no GitHub e os distribui; nunca acessa objetos Selenium."""
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
-        log("Leitor de comandos desativado: configure COMMAND_GITHUB_TOKEN e GITHUB_REPOSITORY.", Fore.YELLOW)
+        log(
+            "Leitor de comandos desativado: configure COMMAND_GITHUB_TOKEN e GITHUB_REPOSITORY.",
+            Fore.YELLOW
+        )
         return
 
-    # Ignora comandos antigos que já estavam na fila antes deste processo iniciar.
     conhecidos = set()
     try:
         conhecidos = {item["name"] for item in listar_arquivos_comandos()}
@@ -271,6 +318,8 @@ def monitorar_comandos(account_ids):
     while True:
         try:
             arquivos = listar_arquivos_comandos()
+
+            # Lê apenas arquivos novos desde o início deste processo.
             for arquivo in arquivos:
                 nome = arquivo.get("name", "")
                 if nome in conhecidos:
@@ -281,6 +330,8 @@ def monitorar_comandos(account_ids):
                     comando = obter_comando(caminho)
                     if not comando:
                         continue
+
+                    # Marca como conhecido depois de conseguir ler o JSON.
                     conhecidos.add(nome)
 
                     if comando.get("action") != "say":
@@ -289,51 +340,97 @@ def monitorar_comandos(account_ids):
                     mensagem = str(comando.get("message", ""))
                     alvos = set(int(item) for item in comando.get("targets", []))
                     alvos_locais = alvos.intersection(account_ids_set)
+
                     if not mensagem or len(mensagem) > 100 or not alvos_locais:
                         continue
 
-                    criado_em = datetime.fromisoformat(
-                        comando.get("created_at", "").replace("Z", "+00:00")
-                    )
+                    data_criacao = comando.get("created_at")
+                    if not data_criacao:
+                        log(f"Comando ignorado por não possuir created_at: {nome}", Fore.YELLOW)
+                        continue
+
+                    criado_em = datetime.fromisoformat(data_criacao.replace("Z", "+00:00"))
                     if criado_em.tzinfo is None:
                         criado_em = criado_em.replace(tzinfo=timezone.utc)
+
                     idade = (datetime.now(timezone.utc) - criado_em).total_seconds()
+                    if idade < -60:
+                        log(f"Comando com data futura inválida ignorado: {nome}", Fore.YELLOW)
+                        continue
                     if idade > COMMAND_MAX_AGE_SECONDS:
                         log(f"Comando antigo ignorado: {nome}.", Fore.YELLOW)
                         continue
 
-                    comando_id = str(comando.get("id", nome))
+                    comando_id = str(comando.get("id") or nome.removesuffix(".json"))
+                    if "undefined" in comando_id.lower():
+                        log(f"Comando com identificador inválido ignorado: {nome}", Fore.YELLOW)
+                        continue
+
+                    if comando_id in pendentes:
+                        continue
+
                     pendentes[comando_id] = {
                         "message": mensagem,
                         "targets": alvos_locais,
-                        "sent": set(),
+                        "dispatched": set(),
                         "created_at": criado_em,
                     }
-                    log(f"Novo comando FALAR recebido ({comando_id}) para contas {sorted(alvos_locais)}.", Fore.CYAN)
+                    with lock:
+                        comandos_concluidos.setdefault(comando_id, set())
+
+                    log(
+                        f"Novo comando FALAR recebido ({comando_id}) "
+                        f"para contas {sorted(alvos_locais)}.",
+                        Fore.CYAN
+                    )
+
                 except Exception as erro:
                     log(f"Falha ao ler o comando {nome}: {repr(erro)}", Fore.YELLOW)
 
             agora = datetime.now(timezone.utc)
+
+            # Distribui os comandos para as filas de cada conta.
             for comando_id, item in list(pendentes.items()):
                 idade = (agora - item["created_at"]).total_seconds()
                 if idade > COMMAND_MAX_AGE_SECONDS:
-                    log(f"Comando {comando_id} expirou antes de todas as contas executarem.", Fore.YELLOW)
+                    log(
+                        f"Comando {comando_id} expirou antes de todas as contas executarem.",
+                        Fore.YELLOW
+                    )
                     pendentes.pop(comando_id, None)
                     continue
 
-                for account_id in sorted(item["targets"] - item["sent"]):
-                    with lock:
-                        driver = drivers_ativos.get(account_id)
-                    if driver is None:
-                        continue
-                    try:
-                        enviar_mensagem(driver, account_id, item["message"])
-                        item["sent"].add(account_id)
-                    except Exception as erro:
-                        log(f"[Conta {account_id}] Não foi possível enviar agora; tentará novamente: {repr(erro)}", Fore.YELLOW)
+                with lock:
+                    concluidas = set(comandos_concluidos.get(comando_id, set()))
 
-                if item["targets"].issubset(item["sent"]):
-                    log(f"Comando {comando_id} concluído para todas as contas deste grupo.", Fore.GREEN)
+                for account_id in sorted(item["targets"]):
+                    if account_id in concluidas or account_id in item["dispatched"]:
+                        continue
+
+                    fila = filas_comandos.get(account_id)
+                    if fila is None:
+                        continue
+
+                    fila.put((
+                        comando_id,
+                        item["message"],
+                        item["created_at"].timestamp(),
+                        0,
+                    ))
+                    item["dispatched"].add(account_id)
+                    log(
+                        f"[Conta {account_id}] Comando {comando_id} adicionado à fila de execução.",
+                        Fore.CYAN
+                    )
+
+                with lock:
+                    concluidas = set(comandos_concluidos.get(comando_id, set()))
+
+                if item["targets"].issubset(concluidas):
+                    log(
+                        f"Comando {comando_id} concluído para todas as contas selecionadas.",
+                        Fore.GREEN
+                    )
                     pendentes.pop(comando_id, None)
 
         except Exception as erro:
@@ -342,29 +439,31 @@ def monitorar_comandos(account_ids):
         time.sleep(COMMAND_POLL_INTERVAL)
 
 
+# ---------- Sessão individual de cada conta ----------
 def iniciar_sessao(username, password, index):
     time.sleep(index * 3)  # evita colisão de logins
 
     while True:
+        driver = None
         with lock:
             status_contas[index] = "🔄 Relogando"
 
-        options = Options()
-        options.add_argument("--headless=new")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.add_argument("--incognito")
-        options.add_argument("--window-size=1366,768")  # importante para cliques em headless
-
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-
         try:
+            options = Options()
+            options.add_argument("--headless=new")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--incognito")
+            options.add_argument("--window-size=1366,768")
+
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+
             log(f"[Conta {index}] Iniciando login para {username}...", Fore.CYAN)
             driver.get("https://habblive.in/")
             wait = WebDriverWait(driver, 25)
 
-            # Fecha banner de cookies se aparecer
+            # Fecha banner de cookies se aparecer.
             try:
                 cookie_banner = wait.until(
                     EC.presence_of_element_located((By.ID, "cookie-law-container"))
@@ -382,10 +481,12 @@ def iniciar_sessao(username, password, index):
             except Exception:
                 pass
 
-            # Login
+            # Login.
             wait.until(EC.presence_of_element_located((By.NAME, "username"))).send_keys(username)
             wait.until(EC.presence_of_element_located((By.NAME, "password"))).send_keys(password)
-            btn_login = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, ".btn.big.green.login-button")))
+            btn_login = wait.until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, ".btn.big.green.login-button"))
+            )
             driver.execute_script("arguments[0].click();", btn_login)
 
             time.sleep(5)
@@ -396,77 +497,88 @@ def iniciar_sessao(username, password, index):
                 status_contas[index] = "✅ Online"
                 drivers_ativos[index] = driver
 
-            # Ações pós-login
+            # Ações pós-login, se habilitadas.
             if EXECUTAR_ACOES:
                 executar_acoes_no_quarto(driver, index)
 
-            # Monitoramento de sessão e reinícios
+            # IMPORTANTE: esta thread é a única que acessa o Selenium desta conta.
             while True:
+                # Confere primeiro se o cliente ainda está no endereço esperado.
                 current_url = driver.current_url
-
                 if current_url != URL_BIGCLIENT:
-                    # Verifica se o elemento principal do Big Client ainda está presente
                     try:
-                        driver.find_element(By.CSS_SELECTOR, ".cursor-pointer.navigation-item.icon.icon-rooms")
-                        # Elemento encontrado → jogo ainda aberto, ignora redirecionamento indireto
-                        pass
-                    except:
-                        # Elemento não encontrado → cliente realmente saiu
-                        log(f"[Conta {index}] ⚠️ Redirecionado para fora ({current_url}). Relogando...", Fore.YELLOW)
+                        driver.find_element(
+                            By.CSS_SELECTOR,
+                            ".cursor-pointer.navigation-item.icon.icon-rooms"
+                        )
+                    except Exception:
+                        log(
+                            f"[Conta {index}] ⚠️ Redirecionado para fora ({current_url}). Relogando...",
+                            Fore.YELLOW
+                        )
                         with lock:
                             if drivers_ativos.get(index) is driver:
                                 drivers_ativos.pop(index, None)
-                        driver.quit()
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
                         time.sleep(2)
                         break
 
+                # Detecta se o cliente está carregado.
                 try:
-                    driver.find_element(By.CSS_SELECTOR, ".cursor-pointer.navigation-item.icon.icon-rooms")
-                except:
-                    log(f"[Conta {index}] ⚠️ Cliente reiniciou, aguardando recarregar...", Fore.YELLOW)
-                    try:
-                        WebDriverWait(driver, 90).until(
-                            EC.presence_of_element_located(
-                                (By.CSS_SELECTOR, ".cursor-pointer.navigation-item.icon.icon-rooms")
-                            )
-                        )
-                        log(f"[Conta {index}] Cliente recarregado.", Fore.GREEN)
-                        if EXECUTAR_ACOES:
-                            executar_acoes_no_quarto(driver, index)
-                    except Exception as e:
-                        log(f"[Conta {index}] ❌ Cliente não recarregou a tempo: {repr(e)}", Fore.RED)
-
-                time.sleep(CHECK_INTERVAL)
-
-                # Detecta reinício do cliente (mesma URL, UI some e volta)
-                try:
-                    driver.find_element(By.CSS_SELECTOR, ".cursor-pointer.navigation-item.icon.icon-rooms")
+                    driver.find_element(
+                        By.CSS_SELECTOR,
+                        ".cursor-pointer.navigation-item.icon.icon-rooms"
+                    )
                 except Exception:
-                    log(f"[Conta {index}] ⚠️ Cliente reiniciou, aguardando recarregar...", Fore.YELLOW)
+                    log(
+                        f"[Conta {index}] ⚠️ Cliente reiniciou, aguardando recarregar...",
+                        Fore.YELLOW
+                    )
                     try:
                         WebDriverWait(driver, 90).until(
-                            EC.presence_of_element_located((By.CSS_SELECTOR, ".cursor-pointer.navigation-item.icon.icon-rooms"))
+                            EC.presence_of_element_located((
+                                By.CSS_SELECTOR,
+                                ".cursor-pointer.navigation-item.icon.icon-rooms"
+                            ))
                         )
                         log(f"[Conta {index}] Cliente recarregado.", Fore.GREEN)
                         if EXECUTAR_ACOES:
                             executar_acoes_no_quarto(driver, index)
-                    except Exception as e:
-                        log(f"[Conta {index}] ❌ Cliente não recarregou a tempo: {repr(e)}", Fore.RED)
+                    except Exception as erro:
+                        log(
+                            f"[Conta {index}] ❌ Cliente não recarregou a tempo: {repr(erro)}",
+                            Fore.RED
+                        )
 
+                # A fila é processada pela própria thread da conta.
+                processar_comando_da_fila(driver, index)
                 time.sleep(CHECK_INTERVAL)
 
-        except Exception as e:
-            log(f"[Conta {index}] ❌ Erro: {repr(e)}", Fore.RED)
+        except Exception as erro:
+            log(f"[Conta {index}] ❌ Erro: {repr(erro)}", Fore.RED)
             with lock:
                 status_contas[index] = "❌ Erro"
                 if drivers_ativos.get(index) is driver:
                     drivers_ativos.pop(index, None)
-            try:
-                driver.quit()
-            except Exception:
-                pass
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
             time.sleep(5)
 
+        finally:
+            # Retira apenas a referência deste driver; a fila da conta é preservada
+            # para que comandos ainda válidos possam ser executados após o relogin.
+            with lock:
+                if drivers_ativos.get(index) is driver:
+                    drivers_ativos.pop(index, None)
+
+
+# ---------- Inicialização ----------
 # Lê as contas absolutas definidas pelo workflow (ex.: 21,22,23,24,25).
 # Se ACCOUNT_IDS não for informado, mantém compatibilidade com a leitura antiga.
 account_ids_env = os.getenv("ACCOUNT_IDS", "").strip()
@@ -487,30 +599,43 @@ if not accounts:
 
 account_ids_ativos = [item[0] for item in accounts]
 
-# Inicializa status com os números absolutos das contas.
+# Cria uma fila independente para cada conta ativa.
+for account_id in account_ids_ativos:
+    filas_comandos[account_id] = queue.Queue()
+
 with lock:
     for account_id in account_ids_ativos:
         status_contas[account_id] = "⏳ Iniciando"
 
-# Thread do painel
-painel_thread = threading.Thread(target=painel_status, args=(account_ids_ativos,), daemon=True)
+# Thread do painel.
+painel_thread = threading.Thread(
+    target=painel_status,
+    args=(account_ids_ativos,),
+    daemon=True
+)
 painel_thread.start()
 
-# Thread que recebe comandos sem interromper os navegadores de login.
+# Thread que consulta o GitHub e distribui comandos, sem tocar nos navegadores.
 command_thread = threading.Thread(
-    target=monitorar_comandos, args=(account_ids_ativos,), daemon=True
+    target=monitorar_comandos,
+    args=(account_ids_ativos,),
+    daemon=True
 )
 command_thread.start()
 
-# Threads das contas
+# Threads individuais das contas.
 threads = []
 for account_id, username, password in accounts:
-    t = threading.Thread(target=iniciar_sessao, args=(username, password, account_id))
-    t.start()
-    threads.append(t)
+    thread = threading.Thread(
+        target=iniciar_sessao,
+        args=(username, password, account_id),
+        name=f"Conta-{account_id}"
+    )
+    thread.start()
+    threads.append(thread)
 
-# Mantém todas as threads vivas
-for t in threads:
-    t.join()
+# Mantém todas as threads vivas.
+for thread in threads:
+    thread.join()
 
 painel_thread.join()

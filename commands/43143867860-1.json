@@ -1,0 +1,14 @@
+{
+  "id": "43143867860-1",
+  "action": "visit_room",
+  "room_owner": "Solitudine",
+  "room_name": "Taberna's Bar",
+  "targets": [
+    16,
+    17,
+    18,
+    19,
+    20
+  ],
+  "created_at": "2026-11-12T02:48:06.846Z"
+}

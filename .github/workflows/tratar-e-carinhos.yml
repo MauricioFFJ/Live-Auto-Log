@@ -3,56 +3,14 @@ name: (Comando) Tratar e Carinhos
 on:
   workflow_dispatch:
     inputs:
-      contas_01_05:
-        description: "Contas 01-05"
+      contas:
+        description: "Números das contas de 1 a 50 (ex. 1, 2, 7)"
+        type: string
         required: false
-        default: false
+      todas:
+        description: "Todas as contas"
         type: boolean
-      contas_06_10:
-        description: "Contas 06-10"
-        required: false
         default: false
-        type: boolean
-      contas_11_15:
-        description: "Contas 11-15"
-        required: false
-        default: false
-        type: boolean
-      contas_16_20:
-        description: "Contas 16-20"
-        required: false
-        default: false
-        type: boolean
-      contas_21_25:
-        description: "Contas 21-25"
-        required: false
-        default: false
-        type: boolean
-      contas_26_30:
-        description: "Contas 26-30"
-        required: false
-        default: false
-        type: boolean
-      contas_31_35:
-        description: "Contas 31-35"
-        required: false
-        default: false
-        type: boolean
-      contas_36_40:
-        description: "Contas 36-40"
-        required: false
-        default: false
-        type: boolean
-      contas_41_45:
-        description: "Contas 41-45"
-        required: false
-        default: false
-        type: boolean
-      contas_46_50:
-        description: "Contas 46-50"
-        required: false
-        default: false
-        type: boolean
   schedule:
     - cron: "0 3 * * *"
       timezone: "America/Sao_Paulo"
@@ -71,6 +29,7 @@ jobs:
     if: ${{ github.event_name != 'schedule' || vars.TRATAR_CARINHOS_AUTO == 'true' }}
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - name: Validar e publicar TRATAR E CARINHOS
         uses: actions/github-script@v7
         env:
@@ -109,9 +68,7 @@ jobs:
                 ? grupos
                 : grupos.filter(g => solicitados.has(g.faixa));
             } else {
-              selecionados = grupos.filter(g =>
-                inputs[g.campo] === true || inputs[g.campo] === 'true'
-              );
+              selecionados = [{faixa: 'individual', contas: require('./contas.js')(inputs)}];
             }
             if (!selecionados.length) {
               core.setFailed('Selecione ao menos um grupo (manual), ou configure TRATAR_CARINHOS_GRUPOS (agendado).');

@@ -1,0 +1,29 @@
+name: Iniciar todos os logins persistentes
+on: workflow_dispatch
+permissions:
+  actions: write
+jobs:
+  iniciar:
+    if: ${{ vars.HABILITAR_REINICIO == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const ref = context.ref.replace(/^refs\/heads\//, '');
+            const falhas = [];
+            for (let i = 1; i <= 50; i += 5) {
+              const pad = n => String(n).padStart(2, '0');
+              const workflow_id = `persistent-login-${pad(i)}-${pad(i+4)}.yml`;
+              try {
+                const params = {...context.repo, workflow_id, branch: ref, per_page: 1};
+                let ativo = false;
+                for (const status of ['in_progress','queued','waiting','pending','requested']) {
+                  const {data} = await github.rest.actions.listWorkflowRuns({...params,status});
+                  if (data.total_count) { ativo = true; break; }
+                }
+                if (!ativo) await github.rest.actions.createWorkflowDispatch({...context.repo, workflow_id, ref});
+                core.info(workflow_id + (ativo ? ' já ativo' : ' iniciado'));
+              } catch (e) { falhas.push(workflow_id + ': ' + e.message); }
+            }
+            if (falhas.length) core.setFailed(falhas.join('\n'));

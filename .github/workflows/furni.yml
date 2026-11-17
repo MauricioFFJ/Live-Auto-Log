@@ -1,0 +1,48 @@
+name: (Comando) Cookie e dados
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        type: choice
+        description: Ação
+        options:
+          - Cookie
+          - Primeiro dado
+          - Todos os dados
+          - CANCELAR
+      contas:
+        type: string
+        description: Números das contas (ex. 1, 2, 7)
+      todas:
+        description: Todas as contas
+        type: boolean
+        default: false
+permissions:
+  contents: write
+jobs:
+  atualizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const inputs = context.payload.inputs;
+            const ids = require('./contas.js')(inputs);
+            const branch = context.ref.replace(/^refs\/heads\//, '');
+            const params = {...context.repo, path:'commands/furni-state.json'};
+            for (let i = 0; i < 5; i++) {
+              let data;
+              try { ({data} = await github.rest.repos.getContent({...params, ref:branch})); }
+              catch (e) { if (e.status !== 404) throw e; }
+              const modos = data ? JSON.parse(Buffer.from(data.content,'base64')) : {};
+              for (const id of ids) modos[id] = inputs.modo;
+              try {
+                await github.rest.repos.createOrUpdateFileContents({...params, branch, sha:data?.sha,
+                  message:'Atualizar modo do furni', content:Buffer.from(JSON.stringify(modos)).toString('base64')});
+                break;
+              } catch (e) {
+                if (![409,422].includes(e.status) || i === 4) throw e;
+                await new Promise(resolve => setTimeout(resolve, (i+1)*500));
+              }
+            }

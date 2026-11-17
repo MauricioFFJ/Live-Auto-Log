@@ -1,0 +1,64 @@
+name: (Comando) Grupo do quarto
+
+on:
+  workflow_dispatch:
+    inputs:
+      contas:
+        description: "Números das contas de 1 a 50 (ex. 1, 2, 7)"
+        type: string
+        required: false
+      todas:
+        description: "Todas as contas"
+        type: boolean
+        default: false
+      destino:
+        description: Ação no grupo
+        type: choice
+        options:
+          - entrar
+          - sair
+
+permissions:
+  contents: write
+
+jobs:
+  enviar-comando:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Publicar comando GRUPO
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const inputs = context.payload.inputs || {};
+            const contas = require('./contas.js')(inputs);
+
+            const runId = process.env.GITHUB_RUN_ID;
+            const runAttempt = process.env.GITHUB_RUN_ATTEMPT || '1';
+            if (!runId) {
+              core.setFailed('GITHUB_RUN_ID indisponível.');
+              return;
+            }
+            const id = `${runId}-${runAttempt}`;
+            const comando = {
+              id,
+              action: 'group',
+              modo: inputs.destino,
+              targets: contas,
+              created_at: new Date().toISOString(),
+            };
+            const caminho = `commands/${id}.json`;
+            const branch = context.ref.replace('refs/heads/', '');
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              path: caminho,
+              message: `GRUPO: publicar comando ${id}` ,
+              content: Buffer.from(JSON.stringify(comando, null, 2)).toString('base64'),
+              branch,
+            });
+
+            core.info(`Comando GRUPO publicado: ${id}`);
+            core.info(`Contas selecionadas: ${contas.join(', ')}`);
+            core.info(`Arquivo: ${caminho}`);

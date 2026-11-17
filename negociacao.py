@@ -1,6 +1,7 @@
 import time
 from pathlib import Path
 from selenium.webdriver.support.ui import WebDriverWait
+from urllib3.exceptions import ReadTimeoutError
 
 
 CHOOSER_JS = Path(__file__).with_name("chooser_acoes.js").read_text(encoding="utf8")
@@ -122,7 +123,7 @@ def negociar(driver, usuario, enviar_chat, registrar=print):
 
     try:
         if configuracao is not None:
-            configuracao.timeout = 25
+            configuracao.timeout = max(120, timeout_original or 120)
         _transferir(driver, usuario, enviar_chat, progresso)
     except Exception as erro:
         raise RuntimeError(
@@ -159,20 +160,37 @@ def _abrir_troca(driver, usuario, enviar_chat, progresso):
         tr.click(); return true;
     """))
     progresso("clicando Negociar no menu de Solitudine")
-    espera.until(lambda d: d.execute_script(CHOOSER_JS + """
-        const acao = opcao(menu('Solitudine'), /^negociar$/);
-        if (!acao) return false;
-        acao.el.click(); fechar(); return true;
-    """))
+    try:
+        espera.until(lambda d: d.execute_script(CHOOSER_JS + """
+            if (!opcao(menu('Solitudine'), /^negociar$/)) return false;
+            // Devolve o controle antes de o React montar o inventário inteiro.
+            setTimeout(() => {
+                const acao = opcao(menu('Solitudine'), /^negociar$/);
+                if (acao) acao.el.click();
+            }, 0);
+            return true;
+        """))
+    except ReadTimeoutError:
+        progresso("resposta do clique atrasou; conferindo se a troca já abriu")
     progresso("aguardando janela de troca com Solitudine")
-    espera.until(lambda d: d.execute_script(TROCA_JS, "estado", usuario, None)["aberta"])
+    WebDriverWait(driver, 60, poll_frequency=1).until(
+        lambda d: d.execute_script(TROCA_JS, "estado", usuario, None)["aberta"]
+    )
 
 
 def _transferir(driver, usuario, enviar_chat, progresso):
     espera = WebDriverWait(driver, 8, poll_frequency=0.25)
 
     def executar(acao="estado", argumento=None):
-        return driver.execute_script(TROCA_JS, acao, usuario, argumento)
+        try:
+            return driver.execute_script(TROCA_JS, acao, usuario, argumento)
+        except ReadTimeoutError:
+            if acao in ("estado", "limpar_filtro", "aviso"):
+                raise
+            # O clique pode ter sido aplicado. A espera específica de cada etapa
+            # confere seu efeito (contador, seleção ou fechamento) sem reenviá-lo.
+            progresso(f"resposta de '{acao}' atrasou; verificando efeito no jogo")
+            return {"resposta_incerta": True}
 
     def estado():
         atual = executar()

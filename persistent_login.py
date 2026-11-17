@@ -1314,7 +1314,12 @@ def processar_comando_da_fila(driver, account_id):
         elif acao == "reciclar":
             reciclar(driver, mensagem)
         elif acao == "trade":
-            negociar(driver, os.environ[f"HABBLIVE_USERNAME_{account_id}"])
+            negociar(
+                driver,
+                os.environ[f"HABBLIVE_USERNAME_{account_id}"],
+                lambda texto: enviar_mensagem(driver, account_id, texto, comando_id),
+                lambda etapa: marcar_etapa(account_id, etapa, status="🔄 NEGOCIAR"),
+            )
         elif acao == "friends":
             aceitar_amigos(driver)
         elif acao == "voucher":
